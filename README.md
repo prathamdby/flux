@@ -55,10 +55,40 @@ python data_collector.py
 
 The system generates `flux_data.csv` with the following metrics:
 
+- **Session Metadata:** Session ID, warmup flag, gap flag
 - **Market Data:** Mid price, spread, bid/ask depth
 - **HFT Metrics:** OFI, VPIN, microprice, tick momentum
 - **Flow Metrics:** Trade volume, direction, churn, cancel rates
 - **ML Targets:** Forward returns, directional labels
+
+### Resumable Collection
+
+The data collector supports resumable operation:
+
+- **First run:** Creates new `flux_data.csv` with headers
+- **Subsequent runs:** Appends to existing file with new session ID
+- Each session gets a unique UUID for tracking
+- First 10 rows per session are flagged as `warmup_flag=1` (unstable metrics)
+- Gaps > 5 seconds between rows are flagged as `gap_flag=1`
+
+### Data Cleaning for Training
+
+Before using collected data for ML training, filter out:
+
+1. **Warmup rows:** `warmup_flag == 1` (first rows after restart with empty buffers)
+2. **Gap rows:** `gap_flag == 1` (rows after collection interruptions)
+3. **Incomplete labels:** `forward_return_5s is None` (rows without future data)
+
+Example filtering (pandas):
+
+```python
+df = pd.read_csv('flux_data.csv')
+df_clean = df[
+    (df['warmup_flag'] == 0) &
+    (df['gap_flag'] == 0) &
+    (df['forward_return_5s'].notna())
+]
+```
 
 ## Project Structure
 

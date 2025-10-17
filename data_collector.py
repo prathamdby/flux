@@ -19,7 +19,9 @@ import csv
 import io
 import json
 import math
+import os
 import time
+import uuid
 from collections import deque
 
 import aiofiles
@@ -36,6 +38,9 @@ SNAPSHOT_URL = f"https://fapi.binance.com/fapi/v1/depth?symbol={SYMBOL}&limit=10
 OUT_CSV = "flux_data.csv"
 CSV_FIELDNAMES = [
     "ts",
+    "session_id",
+    "warmup_flag",
+    "gap_flag",
     "mid",
     "spread",
     "spread_bps",
@@ -63,6 +68,8 @@ CSV_FIELDNAMES = [
 WINDOW_SEC = 1.0
 FORWARD_WINDOW_SEC = 5.0  # For forward return labels
 OFI_DEPTH_LEVELS = 15  # Multi-level OFI calculation depth
+WARMUP_ROWS = 10  # Number of initial rows to flag as warmup after restart
+GAP_THRESHOLD_SEC = 5.0  # Flag gap if time between rows exceeds this
 
 # Retry & resilience config
 RETRY_BACKOFF_BASE = 1.0  # Start with 1 second
@@ -117,6 +124,10 @@ lastUpdateId = 0
 csv_file = None
 csv_queue = None
 csv_writer_task = None
+
+# session tracking
+session_id = None
+rows_written_this_session = 0
 
 
 def get_elapsed_time():
@@ -197,10 +208,11 @@ def _serialize_row(row):
     return _csv_line_from_values(values)
 
 
-async def csv_writer_worker(queue: asyncio.Queue, file):
-    header_line = _csv_line_from_values(CSV_FIELDNAMES)
-    await file.write(header_line)
-    await file.flush()
+async def csv_writer_worker(queue: asyncio.Queue, file, write_header=True):
+    if write_header:
+        header_line = _csv_line_from_values(CSV_FIELDNAMES)
+        await file.write(header_line)
+        await file.flush()
 
     while True:
         rows = await queue.get()
@@ -285,13 +297,14 @@ def reset_window():
 
 
 def collect_completed_rows():
-    global forward_buffer
+    global forward_buffer, rows_written_this_session
 
     if len(forward_buffer) < 2:
         return []
 
     current_time = time.time()
     completed = []
+    prev_ts = None
 
     for row in forward_buffer:
         if row.get("_written"):
@@ -300,6 +313,14 @@ def collect_completed_rows():
         row_time = row["ts"] / 1000.0
         if current_time - row_time < FORWARD_WINDOW_SEC:
             continue
+
+        if prev_ts is not None:
+            time_gap = (row["ts"] - prev_ts) / 1000.0
+            row["gap_flag"] = 1 if time_gap > GAP_THRESHOLD_SEC else 0
+        else:
+            row["gap_flag"] = 0
+
+        prev_ts = row["ts"]
 
         if row["mid"] > 0 and row.get("forward_return_5s") is None:
             target_time = row["ts"] + (FORWARD_WINDOW_SEC * 1000)
@@ -316,6 +337,7 @@ def collect_completed_rows():
 
         completed.append(row)
         row["_written"] = True
+        rows_written_this_session += 1
 
     if len(completed) > 10:
         cutoff_time = current_time - (FORWARD_WINDOW_SEC * 2)
@@ -329,7 +351,7 @@ def collect_completed_rows():
 
 
 def compute_metrics(ofi_acc):
-    global prev_ofi, prev_velocity, prev_mid, bids, asks
+    global prev_ofi, prev_velocity, prev_mid, bids, asks, session_id, rows_written_this_session
 
     best_bid = bids.peekitem(-1)[0] if bids else 0
     best_ask = asks.peekitem(0)[0] if asks else 0
@@ -420,8 +442,13 @@ def compute_metrics(ofi_acc):
                 vol = float(abs(rets[0]))
 
     ts = int(time.time() * 1000)
+    warmup_flag = 1 if rows_written_this_session < WARMUP_ROWS else 0
+
     metrics = {
         "ts": ts,
+        "session_id": session_id,
+        "warmup_flag": warmup_flag,
+        "gap_flag": 0,
         "mid": mid,
         "spread": spread,
         "spread_bps": spread_bps,
@@ -448,8 +475,6 @@ def compute_metrics(ofi_acc):
     }
     reset_window()
     prev_mid = mid
-
-    # Add to forward buffer
     forward_buffer.append(metrics.copy())
 
     return metrics
@@ -577,9 +602,11 @@ async def periodic_metrics_writer(ofi_acc_container, win_start_container):
 
 
 async def run():
-    global bids, asks, lastUpdateId, csv_file, start_time, csv_queue, csv_writer_task
+    global bids, asks, lastUpdateId, csv_file, start_time, csv_queue, csv_writer_task, session_id, rows_written_this_session
 
     start_time = time.time()
+    session_id = str(uuid.uuid4())
+    rows_written_this_session = 0
 
     print_banner()
 
@@ -599,9 +626,22 @@ async def run():
 
     print(f"📸 Snapshot: {len(bids)} bid | {len(asks)} ask | Mid: ${mid_price:,.2f}")
 
+    file_exists = os.path.exists(OUT_CSV)
+    file_mode = "a" if file_exists else "w"
+    write_header = not file_exists
+
+    if file_exists:
+        print(f"📄 Resuming - appending to existing {OUT_CSV}")
+        print(f"🆔 Session ID: {session_id}")
+    else:
+        print(f"📄 Creating new {OUT_CSV}")
+        print(f"🆔 Session ID: {session_id}")
+
     csv_queue = asyncio.Queue()
-    csv_file = await aiofiles.open(OUT_CSV, "w")
-    csv_writer_task = asyncio.create_task(csv_writer_worker(csv_queue, csv_file))
+    csv_file = await aiofiles.open(OUT_CSV, file_mode)
+    csv_writer_task = asyncio.create_task(
+        csv_writer_worker(csv_queue, csv_file, write_header)
+    )
     print(f"💾 CSV ready: {OUT_CSV}\n")
 
     ofi_acc_container = [0.0]
