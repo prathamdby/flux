@@ -278,6 +278,16 @@ def run_pipeline():
     else:
         print(f"\nCleaned dataset: {len(df):,} rows")
 
+    if len(df) == 0:
+        raw_count = len(load_raw_data())
+        min_required = max(config.ROLLING_WINDOWS)
+        raise ValueError(
+            f"Insufficient data for feature engineering.\n"
+            f"   Raw samples: {raw_count:,}\n"
+            f"   Required minimum: {min_required:,} (largest rolling window)\n"
+            f"   Solution: Collect more data using data_collector.py"
+        )
+
     # Create splits
     train_df, val_df, test_df = create_time_based_splits(df)
 

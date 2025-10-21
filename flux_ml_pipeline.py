@@ -132,11 +132,11 @@ Examples:
             run_cleanup()
 
     except KeyboardInterrupt:
-        print("\n\nPipeline interrupted by user")
+        print("\n\nFLUX PIPELINE INTERRUPTED - Shutdown requested by user")
         sys.exit(1)
 
     except Exception as e:
-        print(f"\n\nPipeline failed: {e}")
+        print(f"\n\nFLUX PIPELINE FAILED: {e}")
         import traceback
 
         traceback.print_exc()

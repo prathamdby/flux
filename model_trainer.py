@@ -50,6 +50,14 @@ def load_processed_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if config.FILTER_ZERO_RETURNS and "price_moved" in train_df.columns:
         train_orig = len(train_df)
         train_df = train_df[train_df["price_moved"] == 1].copy()
+
+        if train_orig == 0:
+            raise ValueError(
+                "Training dataset is empty after filtering.\n"
+                "   This typically indicates insufficient raw data.\n"
+                "   Solution: Run data collection to gather more samples."
+            )
+
         if not config.VERBOSE:
             print(
                 f"   - Training on {len(train_df):,} samples with price movement ({len(train_df)/train_orig:.1%})"
