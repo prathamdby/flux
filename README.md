@@ -90,6 +90,7 @@ python flux_ml_pipeline.py all
 python flux_ml_pipeline.py data      # Data preparation & feature engineering
 python flux_ml_pipeline.py train     # Train quantile models
 python flux_ml_pipeline.py backtest  # Evaluate with multiple strategies
+python flux_ml_pipeline.py cleanup   # Remove all generated files
 ```
 
 **Output:**

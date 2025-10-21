@@ -10,9 +10,11 @@ Part of the Flux end-to-end algorithmic trading system.
 """
 
 import argparse
+import shutil
 import sys
 import time
 
+import config
 import data_pipeline
 import model_trainer
 import backtester
@@ -52,6 +54,41 @@ def run_full_pipeline():
     print("\n")
 
 
+def run_cleanup():
+    """Remove all generated artifacts, data, and reports"""
+    print_main_banner()
+    print("\nCleaning up generated files...\n")
+
+    removed_items = []
+
+    # Remove generated directories
+    dirs_to_remove = [config.DATA_DIR, config.ARTIFACTS_DIR, config.REPORTS_DIR]
+    for dir_path in dirs_to_remove:
+        if dir_path.exists():
+            shutil.rmtree(dir_path)
+            removed_items.append(f"  - {dir_path.name}/")
+
+    # Remove raw data files if they exist
+    raw_files = [
+        config.PROJECT_ROOT / "flux_data.csv",
+        config.PROJECT_ROOT / "flux_data.parquet",
+    ]
+    for file_path in raw_files:
+        if file_path.exists():
+            file_path.unlink()
+            removed_items.append(f"  - {file_path.name}")
+
+    if removed_items:
+        print("Removed:")
+        for item in removed_items:
+            print(item)
+        print("\n[OK] Cleanup complete")
+    else:
+        print("[OK] Nothing to clean (already clean)")
+
+    print("=" * 60 + "\n")
+
+
 def main():
     """Main entrypoint with CLI argument parsing"""
     parser = argparse.ArgumentParser(
@@ -63,12 +100,13 @@ Examples:
   python flux_ml_pipeline.py data          # Data prep only
   python flux_ml_pipeline.py train         # Training only
   python flux_ml_pipeline.py backtest      # Backtesting only
+  python flux_ml_pipeline.py cleanup       # Remove all generated files
         """,
     )
 
     parser.add_argument(
         "command",
-        choices=["all", "data", "train", "backtest"],
+        choices=["all", "data", "train", "backtest", "cleanup"],
         help="Pipeline stage to run",
     )
 
@@ -89,6 +127,9 @@ Examples:
         elif args.command == "backtest":
             print_main_banner()
             backtester.run_backtesting()
+
+        elif args.command == "cleanup":
+            run_cleanup()
 
     except KeyboardInterrupt:
         print("\n\nPipeline interrupted by user")
