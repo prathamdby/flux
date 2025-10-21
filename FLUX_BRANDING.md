@@ -53,6 +53,12 @@ def print_banner():
     print(f"  [Key features/info line 2]")
     print(f"  [Key features/info line 3]")
     print("=" * 70 + "\n")
+
+# Example with clean, professional output (no emojis):
+def print_status():
+    """Print status update"""
+    print("FLUX - Data collection active")
+    print(f"   Samples: {count:,} | Elapsed: {time}")
 ```
 
 ## Runtime Messages
@@ -61,24 +67,24 @@ def print_banner():
 
 - Use "FLUX" prefix for major status updates
 - Examples:
-  - `"🚀 FLUX DATA COLLECTION ACTIVE"`
-  - `"✅ FLUX DATA SAVED SUCCESSFULLY!"`
-  - `"✅ FLUX MODEL TRAINING COMPLETE"`
+  - `"FLUX DATA COLLECTION ACTIVE"`
+  - `"FLUX DATA SAVED SUCCESSFULLY"`
+  - `"FLUX MODEL TRAINING COMPLETE"`
 
 ### Shutdown Messages
 
 - Always include "FLUX" in shutdown notifications
-- Example: `"🛑 FLUX SHUTDOWN REQUESTED - Saving data..."`
+- Example: `"FLUX SHUTDOWN REQUESTED - Saving data..."`
 
 ### Status Updates
 
 - Use "FLUX -" prefix for significant state changes
-- Example: `"💾 FLUX - FINALIZING DATA:"`
+- Example: `"FLUX - FINALIZING DATA:"`
 
 ### Completion Messages
 
 - Reference next Flux module or stage
-- Example: `"👋 Flux data collection complete. System ready for next stage."`
+- Example: `"Flux data collection complete. System ready for next stage."`
 
 ## File Naming
 
@@ -154,6 +160,7 @@ When adding a new script, ensure:
 **Professional** - This is enterprise-grade trading software  
 **Systematic** - Emphasize the interconnected pipeline  
 **Technical** - Use proper terminology (OFI, VPIN, etc.)  
-**Actionable** - Guide users to next steps
+**Actionable** - Guide users to next steps  
+**Minimal** - Clean output without visual clutter
 
-Avoid: Cutesy language, excessive emojis (1-2 per message max), marketing speak
+Avoid: Cutesy language, emojis, marketing speak, unnecessary decoration

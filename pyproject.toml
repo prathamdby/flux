@@ -6,8 +6,15 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiofiles>=25.1.0",
+    "backtesting>=0.6.5",
+    "lightgbm>=4.6.0",
+    "matplotlib>=3.10.7",
     "numpy>=2.3.4",
+    "pandas>=2.3.3",
+    "pyarrow>=21.0.0",
     "requests>=2.32.5",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
     "sortedcontainers>=2.4.0",
     "websockets>=15.0.1",
 ]

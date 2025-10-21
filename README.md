@@ -14,16 +14,25 @@ Collect real-time market data from cryptocurrency exchanges, process it into mea
 
 The system will continuously learn from market patterns, adapt to changing conditions, and operate independently to generate consistent returns while managing risk through position sizing, stop losses, and portfolio diversification.
 
-**Current Progress:** ✅ Data collection system is complete and running
+**Current Progress:** ✅ Data collection complete | ✅ ML pipeline implemented
 
 ## Current Status
 
-**Active Module:** Data Collection
+**Phase 1 - Data Collection:** ✅ Complete
 
-- Collecting real-time BTC/USDT market data
-- Computing 1-second HFT metrics
-- Generating 5-second forward return labels
-- Output: `flux_data.csv`
+- Real-time BTC/USDT market data collection
+- Configurable aggregation windows (default: 60s bars)
+- Configurable forward return labels (default: 300s)
+- Data quality filtering (only saves samples with price movement)
+- Output: CSV or Parquet format
+- Quality statistics tracking for monitoring collection effectiveness
+
+**Phase 2 - ML Pipeline:** ✅ Complete
+
+- Quantile regression models (LightGBM)
+- Multi-strategy backtesting framework
+- Cost-aware PnL evaluation
+- Feature engineering with LOB priors
 
 ## Architecture
 
@@ -38,43 +47,132 @@ Data Collection → Feature Engineering → Model Training → Strategy Engine �
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.13+
 - UV package manager
 
 ### Installation
 
 ```bash
-# Install dependencies
-uv add aiofiles numpy requests websockets sortedcontainers
+# Install all dependencies
+uv sync
+```
 
-# Run data collection
+### Phase 1: Data Collection
+
+```bash
+# Run data collection (streams live market data)
 python data_collector.py
 ```
 
-### Output
+**Configuration Options** (edit top of `data_collector.py`):
 
-The system generates `flux_data.csv` with the following metrics:
+- `WINDOW_SEC` - Aggregation window (default: 60s for 1-minute bars)
+- `FORWARD_WINDOW_SEC` - Forward return horizon (default: 300s for 5-minute labels)
+- `MIN_PRICE_MOVEMENT` - Minimum return to save (default: 0.001% to filter noise)
+- `FILTER_ZERO_MOVEMENT` - Enable quality filtering (default: True)
+- `USE_PARQUET` - Output format (default: True for Parquet, False for CSV)
+
+**Output:** `flux_data.parquet` (or `.csv` if configured) with HFT metrics:
 
 - **Market Data:** Mid price, spread, bid/ask depth
 - **HFT Metrics:** OFI, VPIN, microprice, tick momentum
 - **Flow Metrics:** Trade volume, direction, churn, cancel rates
 - **ML Targets:** Forward returns, directional labels
+- **Quality Stats:** Real-time tracking of data movement percentage
+
+### Phase 2: ML Pipeline
+
+```bash
+# Run complete ML pipeline (data prep → train → backtest)
+python flux_ml_pipeline.py all
+
+# Or run individual stages:
+python flux_ml_pipeline.py data      # Data preparation & feature engineering
+python flux_ml_pipeline.py train     # Train quantile models
+python flux_ml_pipeline.py backtest  # Evaluate with multiple strategies
+```
+
+**Output:**
+
+- `data/flux_train.parquet` - Training data with engineered features
+- `artifacts/flux_model_q*.txt` - Trained quantile models
+- `reports/flux_backtest_summary.txt` - Plain-language results
+- `reports/plots/` - Strategy comparison visualizations
+
+### Configuration
+
+Edit `config.py` to customize:
+
+- Train/val/test split ratios
+- LightGBM hyperparameters
+- Quantile levels (default: 0.1, 0.5, 0.9)
+- Trading costs (default: 5 bps)
+- Strategy parameters
 
 ## Project Structure
 
 ```
 flux/
-├── data_collector.py          # Market data collection
-├── feature_engineering.py     # Feature creation
-├── model_trainer.py           # ML model training
-├── strategy_engine.py         # Trading strategy
-├── order_manager.py           # Order execution
-├── backtester.py              # Strategy backtesting
-├── config.py                  # System configuration
-├── utils.py                   # Shared utilities
+├── data_collector.py          # ✅ Market data collection (WebSocket streams)
+├── data_pipeline.py           # ✅ Feature engineering & preprocessing
+├── model_trainer.py           # ✅ Quantile regression training
+├── backtester.py              # ✅ Multi-strategy backtesting
+├── flux_ml_pipeline.py        # ✅ Unified CLI orchestrator
+├── config.py                  # ✅ System configuration
 ├── FLUX_BRANDING.md           # Branding guidelines
-└── flux_data.csv             # Generated market data
+├── flux_data.parquet          # Raw market data (Parquet format)
+├── data/                      # Processed datasets (parquet)
+├── artifacts/                 # Trained models & diagnostics
+└── reports/                   # Backtest results & visualizations
 ```
+
+## ML Approach
+
+### Quantile Regression
+
+Flux uses **quantile regression** instead of traditional point predictions because:
+
+1. **Captures Uncertainty:** Predicts distribution (Q10, Q50, Q90) rather than single values
+2. **Risk-Aware:** Separates upside potential from downside risk
+3. **Robust to Outliers:** Pinball loss is more robust than MSE in financial data
+4. **Actionable:** Quantiles directly inform position sizing and entry/exit thresholds
+
+### Feature Engineering
+
+Based on LOB microstructure research ([Briola et al., 2024](https://arxiv.org/html/2403.09267v3)):
+
+- **Order Flow Imbalance (OFI):** Multi-level weighted depth changes
+- **VPIN:** Volume-synchronized informed trading probability
+- **Microstructure Features:** Spread-volatility ratios, depth imbalance, trade pressure
+- **Temporal Features:** Lag features and rolling statistics for pattern detection
+
+### Backtesting Strategies
+
+**Quantile-Based:**
+
+- Momentum: Trade on extreme quantile predictions
+- Conservative: Tight thresholds, fewer trades
+- Aggressive: Wider thresholds, more trades
+
+**Classic Baselines:**
+
+- Bollinger Breakout: Mean reversion on band touches
+- VWAP Mean Reversion: Trade deviations from volume-weighted average
+- Momentum Crossover: Simple moving average crossovers
+
+All strategies include realistic transaction costs (5 bps) and clear, non-technical reporting.
+
+## Key Features
+
+✅ **Configurable Timeframes:** Adjustable aggregation windows (1s to 5min+)  
+✅ **Data Quality Filtering:** Only save samples with meaningful price movement  
+✅ **Advanced Metrics:** Multi-level OFI, VPIN, microprice edge  
+✅ **Flexible Output:** CSV or Parquet format with batched writes  
+✅ **Production-Ready:** Async architecture, error handling, auto-reconnection  
+✅ **Cost-Aware:** Transaction costs baked into backtesting  
+✅ **Interpretable:** Feature importance analysis and plain-language reports  
+✅ **Multi-Strategy:** Test multiple approaches simultaneously  
+✅ **Real-time Monitoring:** Quality statistics during collection
 
 ## Contributing
 

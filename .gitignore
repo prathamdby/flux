@@ -11,4 +11,9 @@ wheels/
 
 # Flux output files
 flux_data.csv
-*.csv
+flux_data.parquet
+
+# Generated data and artifacts
+data/
+artifacts/
+reports/

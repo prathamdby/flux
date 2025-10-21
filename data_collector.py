@@ -21,9 +21,11 @@ import json
 import math
 import time
 from collections import deque
+from pathlib import Path
 
 import aiofiles
 import numpy as np
+import pandas as pd
 import requests
 import websockets
 from sortedcontainers import SortedDict
@@ -34,6 +36,8 @@ DEPTH_WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@depth20@100ms"
 TRADE_WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@aggTrade"
 SNAPSHOT_URL = f"https://fapi.binance.com/fapi/v1/depth?symbol={SYMBOL}&limit=1000"
 OUT_CSV = "flux_data.csv"
+OUT_PARQUET = "flux_data.parquet"
+USE_PARQUET = True  # Set to False to use CSV instead
 CSV_FIELDNAMES = [
     "ts",
     "mid",
@@ -60,8 +64,17 @@ CSV_FIELDNAMES = [
     "forward_return_5s",
     "target_direction",
 ]
-WINDOW_SEC = 1.0
-FORWARD_WINDOW_SEC = 5.0  # For forward return labels
+
+# ========== CONFIGURABLE WINDOWS ==========
+# Recommendation: Use 60s bars with 300s forward for better signal quality
+WINDOW_SEC = 60.0  # Changed from 1.0 to 60.0 (1-minute bars)
+FORWARD_WINDOW_SEC = 300.0  # Changed from 5.0 to 300.0 (5-minute forward)
+
+# ========== DATA QUALITY FILTERS ==========
+# Only save samples where price moved meaningfully (reduces noise by ~99%)
+MIN_PRICE_MOVEMENT = 0.00001  # Minimum |return| to save (0.001%)
+FILTER_ZERO_MOVEMENT = True  # Set to False to save all samples
+
 OFI_DEPTH_LEVELS = 15  # Multi-level OFI calculation depth
 
 # Retry & resilience config
@@ -79,6 +92,11 @@ start_time = 0  # Track when script started
 # Health monitoring
 last_depth_msg_time = 0
 last_trade_msg_time = 0
+
+# Data quality statistics
+samples_collected = 0
+samples_with_movement = 0
+total_price_change = 0.0
 
 # rolling buffers
 ROLL_N = 100
@@ -146,15 +164,15 @@ async def retry_with_backoff(coro_func, name, *args, **kwargs):
         try:
             await coro_func(*args, **kwargs)
             # If we get here, connection ended normally (shouldn't happen in infinite loop)
-            print(f"\n⚠️  {name} ended unexpectedly, reconnecting...")
+            print(f"\n{name} ended unexpectedly, reconnecting...")
         except asyncio.CancelledError:
-            print(f"\n🛑 {name} cancelled, shutting down...")
+            print(f"\n{name} cancelled, shutting down...")
             raise  # Propagate cancellation
         except Exception as e:
             attempt += 1
             backoff = min(RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX)
-            print(f"\n❌ {name} failed: {e}")
-            print(f"🔄 Reconnecting in {backoff:.1f}s (attempt #{attempt})...")
+            print(f"\n{name} failed: {e}")
+            print(f"Reconnecting in {backoff:.1f}s (attempt #{attempt})...")
             await asyncio.sleep(backoff)
             # Reset counter on successful connection (will be set by next iteration)
             if attempt > 5:
@@ -213,15 +231,59 @@ async def csv_writer_worker(queue: asyncio.Queue, file):
         queue.task_done()
 
 
+async def parquet_writer_worker(queue: asyncio.Queue, output_path: str):
+    """Write rows to Parquet file in batches"""
+    buffer = []
+    first_write = True
+
+    while True:
+        rows = await queue.get()
+        if rows is None:
+            # Flush remaining buffer before exit
+            if buffer:
+                df = pd.DataFrame(buffer)
+                if first_write:
+                    df.to_parquet(output_path, index=False)
+                    first_write = False
+                else:
+                    # Append mode for parquet
+                    existing_df = pd.read_parquet(output_path)
+                    combined = pd.concat([existing_df, df], ignore_index=True)
+                    combined.to_parquet(output_path, index=False)
+            queue.task_done()
+            break
+
+        buffer.extend(rows)
+
+        # Write in batches of 100 rows
+        if len(buffer) >= 100:
+            df = pd.DataFrame(buffer)
+            if first_write:
+                df.to_parquet(output_path, index=False)
+                first_write = False
+            else:
+                # Append mode for parquet
+                existing_df = pd.read_parquet(output_path)
+                combined = pd.concat([existing_df, df], ignore_index=True)
+                combined.to_parquet(output_path, index=False)
+            buffer = []
+
+        queue.task_done()
+
+
 def print_banner():
     """Print Flux startup banner"""
+    output_format = "Parquet" if USE_PARQUET else "CSV"
+    output_file = OUT_PARQUET if USE_PARQUET else OUT_CSV
     print("\n" + "=" * 70)
     print("  FLUX ALGORITHMIC TRADING SYSTEM")
     print("  Market Data Collector - " + SYMBOL)
     print("=" * 70)
-    print(f"  📊 OFI, VPIN, microprice, spread, tick momentum")
-    print(f"  📝 Output: {OUT_CSV}")
-    print(f"  ⏱️  1s metrics | 5s forward labels")
+    print(f"  OFI, VPIN, microprice, spread, tick momentum")
+    print(f"  Output: {output_file} ({output_format})")
+    print(f"  {WINDOW_SEC:.0f}s metrics | {FORWARD_WINDOW_SEC:.0f}s forward labels")
+    if FILTER_ZERO_MOVEMENT:
+        print(f"  Quality filter: Min movement {MIN_PRICE_MOVEMENT:.5%}")
     print("=" * 70 + "\n")
 
 
@@ -232,7 +294,7 @@ def log_stream_stats():
 
     if current_time - last_log_time >= 10:
         print(
-            f"📡 Depth: {depth_message_count}/10s | Trades: {trade_message_count}/10s"
+            f"Stream: Depth {depth_message_count}/10s | Trades {trade_message_count}/10s"
         )
         last_log_time = current_time
         trade_message_count = 0
@@ -285,7 +347,7 @@ def reset_window():
 
 
 def collect_completed_rows():
-    global forward_buffer
+    global forward_buffer, samples_collected, samples_with_movement, total_price_change
 
     if len(forward_buffer) < 2:
         return []
@@ -309,10 +371,30 @@ def collect_completed_rows():
                     future_mid = future_row["mid"]
                     break
 
-            if future_mid and future_mid > 0:
+            # Safe forward return calculation (guard against non-positive values)
+            if future_mid and future_mid > 0 and row["mid"] > 0:
                 forward_ret = math.log(future_mid / row["mid"])
                 row["forward_return_5s"] = forward_ret
                 row["target_direction"] = 1 if forward_ret > 0 else 0
+            else:
+                # Handle edge case where future_mid is invalid
+                forward_ret = 0.0
+                row["forward_return_5s"] = forward_ret
+                row["target_direction"] = 0
+
+        # Track quality statistics
+        samples_collected += 1
+        forward_ret = row.get("forward_return_5s", 0.0) or 0.0
+        abs_ret = abs(forward_ret)
+
+        if abs_ret > MIN_PRICE_MOVEMENT:
+            samples_with_movement += 1
+            total_price_change += abs_ret
+
+        # Apply movement filter if enabled
+        if FILTER_ZERO_MOVEMENT and abs_ret < MIN_PRICE_MOVEMENT:
+            row["_written"] = True  # Mark as written but don't add to completed
+            continue
 
         completed.append(row)
         row["_written"] = True
@@ -459,12 +541,12 @@ async def handle_depth_stream(ofi_acc_container, win_start_container):
     """Handle order book depth updates"""
     global bids, asks, lastUpdateId, depth_message_count, last_depth_msg_time
 
-    print("📖 Depth stream connecting...")
+    print("Depth stream connecting...")
 
     async with websockets.connect(
         DEPTH_WS_URL, close_timeout=1, ping_interval=30, ping_timeout=10
     ) as ws:
-        print("✅ Depth stream live")
+        print("Depth stream live")
         last_depth_msg_time = time.time()
 
         async for msg in ws:
@@ -519,12 +601,12 @@ async def handle_trade_stream():
     """Handle aggregate trade updates"""
     global trade_message_count, last_trade_msg_time
 
-    print("📊 Trade stream connecting...")
+    print("Trade stream connecting...")
 
     async with websockets.connect(
         TRADE_WS_URL, close_timeout=1, ping_interval=30, ping_timeout=10
     ) as ws:
-        print("✅ Trade stream live")
+        print("Trade stream live")
         last_trade_msg_time = time.time()
 
         async for msg in ws:
@@ -539,7 +621,7 @@ async def handle_trade_stream():
 
 async def periodic_metrics_writer(ofi_acc_container, win_start_container):
     """Periodically compute and write metrics"""
-    global csv_queue
+    global csv_queue, samples_collected, samples_with_movement, total_price_change
     row_count = 0
     total_rows_computed = 0
 
@@ -561,8 +643,13 @@ async def periodic_metrics_writer(ofi_acc_container, win_start_container):
 
                 if total_rows_computed % 10 == 0:
                     buffered = len(forward_buffer)
+                    quality_pct = (
+                        samples_with_movement / max(samples_collected, 1)
+                    ) * 100
+                    avg_movement = total_price_change / max(samples_with_movement, 1)
+
                     print(
-                        f"\n📊 #{total_rows_computed} | Saved: {row_count} | Buffered: {buffered}"
+                        f"\nFLUX - Samples #{total_rows_computed} | Saved: {row_count} | Buffered: {buffered}"
                     )
                     print(
                         f"   Mid: ${metrics['mid']:,.2f} | Spread: {metrics['spread_bps']:.1f}bps"
@@ -570,6 +657,10 @@ async def periodic_metrics_writer(ofi_acc_container, win_start_container):
                     print(
                         f"   OFI: {metrics['ofi']:+.2f} | VPIN: {metrics['vpin']:.2%} | Momentum: {metrics['tick_momentum']:+.2f}"
                     )
+                    if samples_collected > 0:
+                        print(
+                            f"   Quality: {quality_pct:.1f}% moved | Avg movement: {avg_movement:.6f}"
+                        )
                     print(f"   Elapsed: {get_elapsed_time()}\n")
 
                 ofi_acc_container[0] = 0.0
@@ -597,17 +688,25 @@ async def run():
     mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
     spread = best_ask - best_bid if best_bid and best_ask else 0
 
-    print(f"📸 Snapshot: {len(bids)} bid | {len(asks)} ask | Mid: ${mid_price:,.2f}")
+    print(f"Snapshot: {len(bids)} bid | {len(asks)} ask | Mid: ${mid_price:,.2f}")
 
     csv_queue = asyncio.Queue()
-    csv_file = await aiofiles.open(OUT_CSV, "w")
-    csv_writer_task = asyncio.create_task(csv_writer_worker(csv_queue, csv_file))
-    print(f"💾 CSV ready: {OUT_CSV}\n")
+
+    if USE_PARQUET:
+        csv_file = None
+        csv_writer_task = asyncio.create_task(
+            parquet_writer_worker(csv_queue, OUT_PARQUET)
+        )
+        print(f"Parquet ready: {OUT_PARQUET}\n")
+    else:
+        csv_file = await aiofiles.open(OUT_CSV, "w")
+        csv_writer_task = asyncio.create_task(csv_writer_worker(csv_queue, csv_file))
+        print(f"CSV ready: {OUT_CSV}\n")
 
     ofi_acc_container = [0.0]
     win_start_container = [time.time()]
 
-    print("🚀 FLUX DATA COLLECTION ACTIVE (Ctrl+C to stop)\n")
+    print("FLUX DATA COLLECTION ACTIVE (Ctrl+C to stop)\n")
 
     try:
         depth_task = asyncio.create_task(
@@ -628,16 +727,16 @@ async def run():
         await asyncio.gather(depth_task, trade_task, metrics_task)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n\n" + "=" * 80)
-        print("🛑 FLUX SHUTDOWN REQUESTED - Saving data...")
+        print("FLUX SHUTDOWN REQUESTED - Saving data...")
         print("=" * 80)
     except Exception as e:
-        print(f"\n⚠️  Error during collection: {e}")
+        print(f"\nError during collection: {e}")
         print("Saving data before exit...")
     finally:
         buffered_count = len(forward_buffer)
         unwritten_count = sum(1 for row in forward_buffer if not row.get("_written"))
 
-        print(f"\n💾 FLUX - FINALIZING DATA:")
+        print(f"\nFLUX - FINALIZING DATA:")
         print(f"   Buffered rows: {buffered_count}")
         print(f"   Need to write: {unwritten_count}")
 
@@ -662,12 +761,21 @@ async def run():
                 await csv_file.flush()
                 await csv_file.close()
 
-        print(f"\n✅ FLUX DATA SAVED SUCCESSFULLY!")
-        print(f"   File: {OUT_CSV}")
+        output_file = OUT_PARQUET if USE_PARQUET else OUT_CSV
+        output_format = "Parquet" if USE_PARQUET else "CSV"
+
+        print(f"\nFLUX DATA SAVED SUCCESSFULLY")
+        print(f"   File: {output_file} ({output_format})")
+        if samples_collected > 0:
+            quality_pct = (samples_with_movement / samples_collected) * 100
+            print(f"   Data quality: {quality_pct:.1f}% with movement")
+            print(
+                f"   Total collected: {samples_collected:,} | Saved: {samples_with_movement:,}"
+            )
         print(f"   Ready for Flux ML model training")
         print(f"   Next: Run feature engineering and model training modules\n")
         print("=" * 80)
-        print("👋 Flux data collection complete. System ready for next stage.")
+        print("Flux data collection complete. System ready for next stage.")
         print("=" * 80 + "\n")
 
 
