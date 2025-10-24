@@ -20,15 +20,13 @@ DATA_DIR = PROJECT_ROOT / "data"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 
-# Input data (prefer Parquet, fall back to CSV)
-_PARQUET_PATH = PROJECT_ROOT / "flux_data.parquet"
-_CSV_PATH = PROJECT_ROOT / "flux_data.csv"
-RAW_DATA_PATH = _PARQUET_PATH if _PARQUET_PATH.exists() else _CSV_PATH
+# Input data (CSV only)
+RAW_DATA_PATH = PROJECT_ROOT / "flux_data.csv"
 
-# Processed data (parquet for efficiency)
-TRAIN_DATA_PATH = DATA_DIR / "flux_train.parquet"
-VAL_DATA_PATH = DATA_DIR / "flux_val.parquet"
-TEST_DATA_PATH = DATA_DIR / "flux_test.parquet"
+# Processed data (CSV for efficiency and simplicity)
+TRAIN_DATA_PATH = DATA_DIR / "flux_train.csv"
+VAL_DATA_PATH = DATA_DIR / "flux_val.csv"
+TEST_DATA_PATH = DATA_DIR / "flux_test.csv"
 
 # Model artifacts
 MODEL_PATH = ARTIFACTS_DIR / "flux_model.txt"

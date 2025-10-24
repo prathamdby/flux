@@ -19,25 +19,25 @@ import csv
 import io
 import json
 import math
+import os
+import queue
+import threading
 import time
 from collections import deque
 from pathlib import Path
 
-import aiofiles
 import numpy as np
-import pandas as pd
 import requests
 import websockets
 from sortedcontainers import SortedDict
 
 SYMBOL = "BTCUSDT"
-SYMBOL_BASE = SYMBOL[:3]  # Extract base currency (SOL, BTC, etc.)
+# Extract base by removing quote currency suffix
+SYMBOL_BASE = SYMBOL.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
 DEPTH_WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@depth20@100ms"
 TRADE_WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@aggTrade"
 SNAPSHOT_URL = f"https://fapi.binance.com/fapi/v1/depth?symbol={SYMBOL}&limit=1000"
 OUT_CSV = "flux_data.csv"
-OUT_PARQUET = "flux_data.parquet"
-USE_PARQUET = True  # Set to False to use CSV instead
 CSV_FIELDNAMES = [
     "ts",
     "mid",
@@ -71,9 +71,9 @@ WINDOW_SEC = 60.0  # Changed from 1.0 to 60.0 (1-minute bars)
 FORWARD_WINDOW_SEC = 300.0  # Changed from 5.0 to 300.0 (5-minute forward)
 
 # ========== DATA QUALITY FILTERS ==========
-# Only save samples where price moved meaningfully (reduces noise by ~99%)
-MIN_PRICE_MOVEMENT = 0.00001  # Minimum |return| to save (0.001%)
-FILTER_ZERO_MOVEMENT = True  # Set to False to save all samples
+# Track quality stats but save all matured rows (filtering done in ML pipeline)
+MIN_PRICE_MOVEMENT = 0.00001  # Minimum |return| for quality tracking (0.001%)
+FILTER_ZERO_MOVEMENT = False  # Always save all matured rows
 
 OFI_DEPTH_LEVELS = 15  # Multi-level OFI calculation depth
 
@@ -81,6 +81,10 @@ OFI_DEPTH_LEVELS = 15  # Multi-level OFI calculation depth
 RETRY_BACKOFF_BASE = 1.0  # Start with 1 second
 RETRY_BACKOFF_MAX = 30.0  # Cap at 30 seconds
 STALE_CONNECTION_TIMEOUT = 60.0  # Reconnect if no data for 60s
+
+# CSV writer config
+FSYNC_EVERY_N_BATCHES = 10  # fsync to disk every N batches
+MATURATION_FLUSH_INTERVAL = 3.0  # Check for matured rows every N seconds
 
 # Logging config
 VERBOSE_LOGGING = True
@@ -132,9 +136,8 @@ vpin_bucket_target = 1.0
 bids = SortedDict()
 asks = SortedDict()
 lastUpdateId = 0
-csv_file = None
-csv_queue = None
-csv_writer_task = None
+write_queue = None
+csv_writer_thread = None
 
 
 def get_elapsed_time():
@@ -202,88 +205,101 @@ def calculate_weighted_ofi(bids: SortedDict, asks: SortedDict):
     return weighted_ofi
 
 
-def _csv_line_from_values(values):
-    buffer = io.StringIO()
-    csv.writer(buffer).writerow(values)
-    return buffer.getvalue()
+class CSVWriter(threading.Thread):
+    """Thread-safe CSV writer that appends rows with periodic fsync"""
 
+    def __init__(self, filepath, fieldnames):
+        super().__init__(daemon=True)
+        self.filepath = filepath
+        self.fieldnames = fieldnames
+        self.queue = queue.Queue()
+        self.batch_count = 0
+        self.total_written = 0
+        self.running = True
 
-def _serialize_row(row):
-    values = [
-        "" if (val := row.get(field)) is None else val for field in CSV_FIELDNAMES
-    ]
-    return _csv_line_from_values(values)
+    def run(self):
+        """Main writer loop running in background thread"""
+        file_exists = os.path.exists(self.filepath)
+        consecutive_errors = 0
+        max_consecutive_errors = 5
 
+        with open(self.filepath, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
 
-async def csv_writer_worker(queue: asyncio.Queue, file):
-    header_line = _csv_line_from_values(CSV_FIELDNAMES)
-    await file.write(header_line)
-    await file.flush()
+            # Write header if file is empty
+            if not file_exists or os.path.getsize(self.filepath) == 0:
+                writer.writeheader()
+                f.flush()
 
-    while True:
-        rows = await queue.get()
-        if rows is None:
-            queue.task_done()
-            break
-        for row in rows:
-            await file.write(_serialize_row(row))
-        await file.flush()
-        queue.task_done()
+            while self.running:
+                try:
+                    rows = self.queue.get(timeout=1.0)
+                    if rows is None:  # Shutdown signal
+                        break
 
+                    # Write batch
+                    for row in rows:
+                        writer.writerow(row)
+                        self.total_written += 1
 
-async def parquet_writer_worker(queue: asyncio.Queue, output_path: str):
-    """Write rows to Parquet file in batches"""
-    buffer = []
-    first_write = True
+                    f.flush()
+                    self.batch_count += 1
 
-    while True:
-        rows = await queue.get()
-        if rows is None:
-            # Flush remaining buffer before exit
-            if buffer:
-                df = pd.DataFrame(buffer)
-                if first_write:
-                    df.to_parquet(output_path, index=False)
-                    first_write = False
-                else:
-                    # Append mode for parquet
-                    existing_df = pd.read_parquet(output_path)
-                    combined = pd.concat([existing_df, df], ignore_index=True)
-                    combined.to_parquet(output_path, index=False)
-            queue.task_done()
-            break
+                    # Periodic fsync to disk
+                    if self.batch_count % FSYNC_EVERY_N_BATCHES == 0:
+                        os.fsync(f.fileno())
 
-        buffer.extend(rows)
+                    self.queue.task_done()
+                    consecutive_errors = 0  # Reset on success
 
-        # Write in batches of 100 rows
-        if len(buffer) >= 100:
-            df = pd.DataFrame(buffer)
-            if first_write:
-                df.to_parquet(output_path, index=False)
-                first_write = False
-            else:
-                # Append mode for parquet
-                existing_df = pd.read_parquet(output_path)
-                combined = pd.concat([existing_df, df], ignore_index=True)
-                combined.to_parquet(output_path, index=False)
-            buffer = []
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(
+                        f"❌ CSV writer error ({consecutive_errors}/{max_consecutive_errors}): {e}"
+                    )
 
-        queue.task_done()
+                    if consecutive_errors >= max_consecutive_errors:
+                        print(
+                            f"❌ CRITICAL: CSV writer failed {max_consecutive_errors} times - shutting down"
+                        )
+                        import traceback
+
+                        traceback.print_exc()
+                        break
+
+                    # Re-queue the batch for retry (if rows is defined)
+                    try:
+                        if "rows" in locals() and rows:
+                            self.queue.put(rows)
+                            print(f"   Re-queued {len(rows)} rows for retry")
+                    except:
+                        pass
+
+                    time.sleep(1)  # Backoff before retry
+                    continue
+
+    def write_rows(self, rows):
+        """Non-blocking enqueue of rows"""
+        self.queue.put(rows)
+
+    def shutdown(self):
+        """Graceful shutdown: drain queue and stop"""
+        self.queue.put(None)
+        self.join(timeout=10.0)
 
 
 def print_banner():
     """Print Flux startup banner"""
-    output_format = "Parquet" if USE_PARQUET else "CSV"
-    output_file = OUT_PARQUET if USE_PARQUET else OUT_CSV
     print("\n" + "=" * 70)
     print("  FLUX ALGORITHMIC TRADING SYSTEM")
     print("  Market Data Collector - " + SYMBOL)
     print("=" * 70)
     print(f"  OFI, VPIN, microprice, spread, tick momentum")
-    print(f"  Output: {output_file} ({output_format})")
+    print(f"  Output: {OUT_CSV} (CSV)")
     print(f"  {WINDOW_SEC:.0f}s metrics | {FORWARD_WINDOW_SEC:.0f}s forward labels")
-    if FILTER_ZERO_MOVEMENT:
-        print(f"  Quality filter: Min movement {MIN_PRICE_MOVEMENT:.5%}")
+    print(f"  All matured rows saved (filter applied in ML pipeline)")
     print("=" * 70 + "\n")
 
 
@@ -391,11 +407,7 @@ def collect_completed_rows():
             samples_with_movement += 1
             total_price_change += abs_ret
 
-        # Apply movement filter if enabled
-        if FILTER_ZERO_MOVEMENT and abs_ret < MIN_PRICE_MOVEMENT:
-            row["_written"] = True  # Mark as written but don't add to completed
-            continue
-
+        # Always save all matured rows (no filtering)
         completed.append(row)
         row["_written"] = True
 
@@ -538,7 +550,7 @@ def compute_metrics(ofi_acc):
 
 
 async def handle_depth_stream(ofi_acc_container, win_start_container):
-    """Handle order book depth updates"""
+    """Handle order book depth updates with stale watchdog"""
     global bids, asks, lastUpdateId, depth_message_count, last_depth_msg_time
 
     print("Depth stream connecting...")
@@ -548,16 +560,38 @@ async def handle_depth_stream(ofi_acc_container, win_start_container):
     ) as ws:
         print("Depth stream live")
         last_depth_msg_time = time.time()
+        synced = False  # Track if we've synced with snapshot
 
         async for msg in ws:
+            # Update message tracking
             depth_message_count += 1
             last_depth_msg_time = time.time()
+
             data = json.loads(msg)
             U, u = data.get("U"), data.get("u")
-            if U and u and u < lastUpdateId:
-                continue
             if not (U and u):
                 continue
+
+            # Binance-compliant sync: wait for event bridging snapshot
+            if not synced:
+                # Drop old buffered events
+                if u <= lastUpdateId:
+                    continue
+                # Event must contain or follow lastUpdateId+1
+                if U <= lastUpdateId + 1 and u >= lastUpdateId + 1:
+                    synced = True
+                    print(
+                        f"Depth stream synced (U={U}, u={u}, lastUpdateId={lastUpdateId})"
+                    )
+                else:
+                    continue  # Buffer until sync
+            else:
+                # After sync, require contiguity
+                if U != lastUpdateId + 1:
+                    print(
+                        f"Depth gap detected (expected {lastUpdateId+1}, got {U}) - resyncing required"
+                    )
+                    raise Exception("Depth sequence gap - forcing resnapshot")
 
             for price_s, qty_s in data.get("b", []):
                 price, qty = float(price_s), float(qty_s)
@@ -593,12 +627,12 @@ async def handle_depth_stream(ofi_acc_container, win_start_container):
                 ofi_acc_container[0] -= delta
                 ingest_update(delta, is_decrease)
 
-            lastUpdateId = max(lastUpdateId, u)
+            lastUpdateId = u  # Set to u for proper sequence tracking
             log_stream_stats()
 
 
 async def handle_trade_stream():
-    """Handle aggregate trade updates"""
+    """Handle aggregate trade updates with stale watchdog"""
     global trade_message_count, last_trade_msg_time
 
     print("Trade stream connecting...")
@@ -612,17 +646,40 @@ async def handle_trade_stream():
         async for msg in ws:
             data = json.loads(msg)
             if data.get("e") == "aggTrade":
-                trade_message_count += 1
+                # Update timestamp for actual trade messages
                 last_trade_msg_time = time.time()
+                trade_message_count += 1
                 price = float(data["p"])
                 quantity = float(data["q"])
                 ingest_trade(price, quantity)
 
 
+async def maturation_flusher():
+    """Periodically flush matured rows independent of metric window"""
+    global write_queue, csv_writer_thread
+    row_count = 0
+
+    try:
+        while True:
+            await asyncio.sleep(MATURATION_FLUSH_INTERVAL)
+
+            try:
+                completed_rows = collect_completed_rows()
+                if completed_rows and csv_writer_thread:
+                    csv_writer_thread.write_rows(completed_rows)
+                    row_count += len(completed_rows)
+            except Exception as e:
+                print(f"Maturation flusher error: {e}")
+                # Continue running despite errors
+                continue
+    except asyncio.CancelledError:
+        print("Maturation flusher cancelled - shutting down gracefully")
+        raise
+
+
 async def periodic_metrics_writer(ofi_acc_container, win_start_container):
     """Periodically compute and write metrics"""
-    global csv_queue, samples_collected, samples_with_movement, total_price_change
-    row_count = 0
+    global write_queue, csv_writer_thread, samples_collected, samples_with_movement, total_price_change
     total_rows_computed = 0
 
     while True:
@@ -634,22 +691,24 @@ async def periodic_metrics_writer(ofi_acc_container, win_start_container):
             if metrics:
                 total_rows_computed += 1
                 # Note: metrics are added to forward_buffer in compute_metrics()
-                # They'll be written once forward returns can be calculated
-
-                completed_rows = collect_completed_rows()
-                if completed_rows:
-                    await csv_queue.put(completed_rows)
-                    row_count += len(completed_rows)
+                # Maturation flusher handles writing once forward returns can be calculated
 
                 if total_rows_computed % 10 == 0:
                     buffered = len(forward_buffer)
+                    written = (
+                        csv_writer_thread.total_written if csv_writer_thread else 0
+                    )
                     quality_pct = (
                         samples_with_movement / max(samples_collected, 1)
                     ) * 100
-                    avg_movement = total_price_change / max(samples_with_movement, 1)
+                    avg_movement = (
+                        total_price_change / max(samples_with_movement, 1)
+                        if samples_with_movement > 0
+                        else 0
+                    )
 
                     print(
-                        f"\nFLUX - Samples #{total_rows_computed} | Saved: {row_count} | Buffered: {buffered}"
+                        f"\nFLUX - Computed: {total_rows_computed} | Written: {written} | Buffered: {buffered}"
                     )
                     print(
                         f"   Mid: ${metrics['mid']:,.2f} | Spread: {metrics['spread_bps']:.1f}bps"
@@ -668,7 +727,7 @@ async def periodic_metrics_writer(ofi_acc_container, win_start_container):
 
 
 async def run():
-    global bids, asks, lastUpdateId, csv_file, start_time, csv_queue, csv_writer_task
+    global bids, asks, lastUpdateId, start_time, csv_writer_thread
 
     start_time = time.time()
 
@@ -690,18 +749,10 @@ async def run():
 
     print(f"Snapshot: {len(bids)} bid | {len(asks)} ask | Mid: ${mid_price:,.2f}")
 
-    csv_queue = asyncio.Queue()
-
-    if USE_PARQUET:
-        csv_file = None
-        csv_writer_task = asyncio.create_task(
-            parquet_writer_worker(csv_queue, OUT_PARQUET)
-        )
-        print(f"Parquet ready: {OUT_PARQUET}\n")
-    else:
-        csv_file = await aiofiles.open(OUT_CSV, "w")
-        csv_writer_task = asyncio.create_task(csv_writer_worker(csv_queue, csv_file))
-        print(f"CSV ready: {OUT_CSV}\n")
+    # Start CSV writer thread
+    csv_writer_thread = CSVWriter(OUT_CSV, CSV_FIELDNAMES)
+    csv_writer_thread.start()
+    print(f"CSV writer ready: {OUT_CSV}\n")
 
     ofi_acc_container = [0.0]
     win_start_container = [time.time()]
@@ -723,8 +774,9 @@ async def run():
         metrics_task = asyncio.create_task(
             periodic_metrics_writer(ofi_acc_container, win_start_container)
         )
+        flusher_task = asyncio.create_task(maturation_flusher())
 
-        await asyncio.gather(depth_task, trade_task, metrics_task)
+        await asyncio.gather(depth_task, trade_task, metrics_task, flusher_task)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n\n" + "=" * 80)
         print("FLUX SHUTDOWN REQUESTED - Saving data...")
@@ -749,29 +801,21 @@ async def run():
                 for row in remaining_rows:
                     row.setdefault("forward_return_5s", None)
                     row.setdefault("target_direction", None)
-                if remaining_rows:
-                    await csv_queue.put(remaining_rows)
+                if remaining_rows and csv_writer_thread:
+                    csv_writer_thread.write_rows(remaining_rows)
+                    # Wait for queue to be fully processed
+                    await asyncio.to_thread(csv_writer_thread.queue.join)
         finally:
-            if csv_queue:
-                await csv_queue.put(None)
-            tasks = [t for t in (csv_writer_task,) if t and not t.done()]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            if csv_file:
-                await csv_file.flush()
-                await csv_file.close()
-
-        output_file = OUT_PARQUET if USE_PARQUET else OUT_CSV
-        output_format = "Parquet" if USE_PARQUET else "CSV"
+            if csv_writer_thread:
+                print(f"   Shutting down CSV writer...")
+                csv_writer_thread.shutdown()
 
         print(f"\nFLUX DATA SAVED SUCCESSFULLY")
-        print(f"   File: {output_file} ({output_format})")
+        print(f"   File: {OUT_CSV} (CSV)")
         if samples_collected > 0:
             quality_pct = (samples_with_movement / samples_collected) * 100
             print(f"   Data quality: {quality_pct:.1f}% with movement")
-            print(
-                f"   Total collected: {samples_collected:,} | Saved: {samples_with_movement:,}"
-            )
+            print(f"   Total collected: {samples_collected:,} | All matured rows saved")
         print(f"   Ready for Flux ML model training")
         print(f"   Next: Run feature engineering and model training modules\n")
         print("=" * 80)

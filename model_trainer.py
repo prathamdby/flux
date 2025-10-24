@@ -42,9 +42,9 @@ def load_processed_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if config.VERBOSE:
         print("Loading processed data...")
 
-    train_df = pd.read_parquet(config.TRAIN_DATA_PATH)
-    val_df = pd.read_parquet(config.VAL_DATA_PATH)
-    test_df = pd.read_parquet(config.TEST_DATA_PATH)
+    train_df = pd.read_csv(config.TRAIN_DATA_PATH)
+    val_df = pd.read_csv(config.VAL_DATA_PATH)
+    test_df = pd.read_csv(config.TEST_DATA_PATH)
 
     # Filter to samples with actual price movement if configured
     if config.FILTER_ZERO_RETURNS and "price_moved" in train_df.columns:

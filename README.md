@@ -23,9 +23,10 @@ The system will continuously learn from market patterns, adapt to changing condi
 - Real-time BTC/USDT market data collection
 - Configurable aggregation windows (default: 60s bars)
 - Configurable forward return labels (default: 300s)
-- Data quality filtering (only saves samples with price movement)
-- Output: CSV or Parquet format
+- All matured samples saved (filtering done in ML pipeline)
+- Output: CSV format with parallel writer thread
 - Quality statistics tracking for monitoring collection effectiveness
+- Robust Binance depth stream synchronization with stale watchdog
 
 **Phase 2 - ML Pipeline:** ✅ Complete
 
@@ -68,11 +69,10 @@ python data_collector.py
 
 - `WINDOW_SEC` - Aggregation window (default: 60s for 1-minute bars)
 - `FORWARD_WINDOW_SEC` - Forward return horizon (default: 300s for 5-minute labels)
-- `MIN_PRICE_MOVEMENT` - Minimum return to save (default: 0.001% to filter noise)
-- `FILTER_ZERO_MOVEMENT` - Enable quality filtering (default: True)
-- `USE_PARQUET` - Output format (default: True for Parquet, False for CSV)
+- `MIN_PRICE_MOVEMENT` - Minimum return for quality tracking (default: 0.001%)
+- `FILTER_ZERO_MOVEMENT` - Disabled (all matured rows saved; filter in ML pipeline)
 
-**Output:** `flux_data.parquet` (or `.csv` if configured) with HFT metrics:
+**Output:** `flux_data.csv` with HFT metrics:
 
 - **Market Data:** Mid price, spread, bid/ask depth
 - **HFT Metrics:** OFI, VPIN, microprice, tick momentum
@@ -95,7 +95,7 @@ python flux_ml_pipeline.py cleanup   # Remove all generated files
 
 **Output:**
 
-- `data/flux_train.parquet` - Training data with engineered features
+- `data/flux_train.csv` - Training data with engineered features
 - `artifacts/flux_model_q*.txt` - Trained quantile models
 - `reports/flux_backtest_summary.txt` - Plain-language results
 - `reports/plots/` - Strategy comparison visualizations
@@ -121,8 +121,8 @@ flux/
 ├── flux_ml_pipeline.py        # ✅ Unified CLI orchestrator
 ├── config.py                  # ✅ System configuration
 ├── FLUX_BRANDING.md           # Branding guidelines
-├── flux_data.parquet          # Raw market data (Parquet format)
-├── data/                      # Processed datasets (parquet)
+├── flux_data.csv              # Raw market data (CSV format)
+├── data/                      # Processed datasets (CSV)
 ├── artifacts/                 # Trained models & diagnostics
 └── reports/                   # Backtest results & visualizations
 ```
@@ -166,10 +166,9 @@ All strategies include realistic transaction costs (5 bps) and clear, non-techni
 ## Key Features
 
 ✅ **Configurable Timeframes:** Adjustable aggregation windows (1s to 5min+)  
-✅ **Data Quality Filtering:** Only save samples with meaningful price movement  
+✅ **Robust Data Collection:** Parallel CSV writer with periodic fsync, minimal data loss  
 ✅ **Advanced Metrics:** Multi-level OFI, VPIN, microprice edge  
-✅ **Flexible Output:** CSV or Parquet format with batched writes  
-✅ **Production-Ready:** Async architecture, error handling, auto-reconnection  
+✅ **Production-Ready:** Async architecture, stale watchdog, auto-reconnection, proper Binance sync  
 ✅ **Cost-Aware:** Transaction costs baked into backtesting  
 ✅ **Interpretable:** Feature importance analysis and plain-language reports  
 ✅ **Multi-Strategy:** Test multiple approaches simultaneously  

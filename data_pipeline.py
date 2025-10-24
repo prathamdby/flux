@@ -34,15 +34,11 @@ def print_banner():
 
 
 def load_raw_data() -> pd.DataFrame:
-    """Load raw market data from CSV or Parquet"""
+    """Load raw market data from CSV"""
     if config.VERBOSE:
         print(f"Loading raw data from {config.RAW_DATA_PATH}...")
 
-    # Detect file format and use appropriate reader
-    if config.RAW_DATA_PATH.suffix == ".parquet":
-        df = pd.read_parquet(config.RAW_DATA_PATH)
-    else:
-        df = pd.read_csv(config.RAW_DATA_PATH)
+    df = pd.read_csv(config.RAW_DATA_PATH)
 
     if config.VERBOSE:
         print(f"   Rows: {len(df):,}")
@@ -220,13 +216,13 @@ def create_time_based_splits(
 def save_processed_data(
     train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
 ):
-    """Save processed datasets to Parquet format"""
+    """Save processed datasets to CSV format"""
     if config.VERBOSE:
         print("\nSaving processed data...")
 
-    train_df.to_parquet(config.TRAIN_DATA_PATH, index=False)
-    val_df.to_parquet(config.VAL_DATA_PATH, index=False)
-    test_df.to_parquet(config.TEST_DATA_PATH, index=False)
+    train_df.to_csv(config.TRAIN_DATA_PATH, index=False)
+    val_df.to_csv(config.VAL_DATA_PATH, index=False)
+    test_df.to_csv(config.TEST_DATA_PATH, index=False)
 
     if config.VERBOSE:
         print(f"   Train: {config.TRAIN_DATA_PATH}")

@@ -68,15 +68,26 @@ def run_cleanup():
             shutil.rmtree(dir_path)
             removed_items.append(f"  - {dir_path.name}/")
 
-    # Remove raw data files if they exist
+    # Remove raw data files if they exist (CSV only)
     raw_files = [
         config.PROJECT_ROOT / "flux_data.csv",
-        config.PROJECT_ROOT / "flux_data.parquet",
     ]
     for file_path in raw_files:
         if file_path.exists():
             file_path.unlink()
             removed_items.append(f"  - {file_path.name}")
+
+    # Remove legacy Parquet files if they exist
+    legacy_files = [
+        config.PROJECT_ROOT / "flux_data.parquet",
+        config.DATA_DIR / "flux_train.parquet",
+        config.DATA_DIR / "flux_val.parquet",
+        config.DATA_DIR / "flux_test.parquet",
+    ]
+    for file_path in legacy_files:
+        if file_path.exists():
+            file_path.unlink()
+            removed_items.append(f"  - {file_path.name} (legacy)")
 
     if removed_items:
         print("Removed:")

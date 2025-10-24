@@ -394,7 +394,7 @@ def run_backtesting():
     # Load test data
     if config.VERBOSE:
         print("\nLoading test data...")
-    test_df = pd.read_parquet(config.TEST_DATA_PATH)
+    test_df = pd.read_csv(config.TEST_DATA_PATH)
     if config.VERBOSE:
         print(f"   {len(test_df):,} test samples")
 
