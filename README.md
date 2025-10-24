@@ -67,8 +67,8 @@ python data_collector.py
 
 **Configuration Options** (edit top of `data_collector.py`):
 
-- `WINDOW_SEC` - Aggregation window (default: 60s for 1-minute bars)
-- `FORWARD_WINDOW_SEC` - Forward return horizon (default: 300s for 5-minute labels)
+- `WINDOW_SEC` - Aggregation window (default: 30s for 30-second bars)
+- `FORWARD_WINDOW_SEC` - Forward return horizon (default: 180s for 3-minute labels)
 - `MIN_PRICE_MOVEMENT` - Minimum return for quality tracking (default: 0.001%)
 - `FILTER_ZERO_MOVEMENT` - Disabled (all matured rows saved; filter in ML pipeline)
 

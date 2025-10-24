@@ -66,9 +66,9 @@ CSV_FIELDNAMES = [
 ]
 
 # ========== CONFIGURABLE WINDOWS ==========
-# Recommendation: Use 60s bars with 300s forward for better signal quality
-WINDOW_SEC = 60.0  # Changed from 1.0 to 60.0 (1-minute bars)
-FORWARD_WINDOW_SEC = 300.0  # Changed from 5.0 to 300.0 (5-minute forward)
+# Recommendation: Use 30s bars with 180s forward for better signal quality
+WINDOW_SEC = 30.0  # 30-second bars
+FORWARD_WINDOW_SEC = 180.0  # 3-minute forward
 
 # ========== DATA QUALITY FILTERS ==========
 # Track quality stats but save all matured rows (filtering done in ML pipeline)
@@ -224,7 +224,9 @@ class CSVWriter(threading.Thread):
         max_consecutive_errors = 5
 
         with open(self.filepath, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer = csv.DictWriter(
+                f, fieldnames=self.fieldnames, extrasaction="ignore"
+            )
 
             # Write header if file is empty
             if not file_exists or os.path.getsize(self.filepath) == 0:
