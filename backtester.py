@@ -85,7 +85,7 @@ def generate_predictions(
 def simple_vectorized_backtest(
     predictions: pd.DataFrame, strategy_name: str, **params
 ) -> dict:
-    """Simple vectorized backtest - more reliable than backtesting.py library"""
+    """Vectorized backtest with proper position sizing and equity tracking"""
 
     if strategy_name == "quantile_directional":
         # Use percentile thresholds on predictions
@@ -121,60 +121,118 @@ def simple_vectorized_backtest(
     else:
         signals = pd.Series(0, index=predictions.index)
 
-    # Calculate returns
-    position = signals.shift(1).fillna(0)  # Enter next period
+    position = signals.shift(1).fillna(0)
 
-    # Forward returns (already scaled)
-    forward_ret = (
-        predictions["actual_return"].fillna(0) / config.RETURN_SCALE_FACTOR
-    )  # Unscale to actual
+    # Unscale forward returns to actual returns
+    forward_ret = predictions["actual_return"].fillna(0) / config.RETURN_SCALE_FACTOR
 
-    # Strategy returns
-    strat_returns = position * forward_ret
+    # Initialize equity tracking
+    equity = np.zeros(len(predictions))
+    equity[0] = config.INITIAL_CASH
+    total_trades = 0
+    winning_trades = 0
+    losing_trades = 0
+    current_trade_pnl = 0.0
+    in_trade = False
 
-    # Apply transaction costs
-    trades = (position != position.shift(1)).astype(int)
-    costs = trades * config.COMMISSION
-    net_returns = strat_returns - costs
+    # Simulate with proper position sizing
+    for i in range(1, len(predictions)):
+        prev_equity = equity[i - 1]
+
+        # Check if we're entering or exiting a trade
+        position_changed = position.iloc[i] != position.iloc[i - 1]
+
+        # Check if we're trading
+        if position.iloc[i] != 0:
+            # Calculate position size in dollars
+            position_value = prev_equity * config.POSITION_SIZE
+
+            # Calculate dollar return on position
+            dollar_return = position_value * position.iloc[i] * forward_ret.iloc[i]
+
+            # Apply transaction costs on entry
+            if position_changed:
+                # Close previous trade before opening new one (handles long↔short flips)
+                if in_trade:
+                    if current_trade_pnl > 0:
+                        winning_trades += 1
+                    else:
+                        losing_trades += 1
+
+                # Open new trade
+                commission_cost = position_value * config.COMMISSION
+                slippage_cost = position_value * config.SLIPPAGE_BPS
+                total_trades += 1
+                in_trade = True
+                current_trade_pnl = -commission_cost - slippage_cost
+            else:
+                commission_cost = 0
+                slippage_cost = 0
+
+            # Accumulate PnL for this trade
+            if in_trade:
+                current_trade_pnl += dollar_return
+
+            net_dollar_return = dollar_return - commission_cost - slippage_cost
+
+            # Update equity
+            equity[i] = prev_equity + net_dollar_return
+        else:
+            # Exiting position
+            if in_trade and position.iloc[i - 1] != 0:
+                # Trade closed - record win/loss
+                if current_trade_pnl > 0:
+                    winning_trades += 1
+                else:
+                    losing_trades += 1
+                current_trade_pnl = 0.0
+                in_trade = False
+
+            # No position
+            equity[i] = prev_equity
+
+        # Prevent negative equity
+        if equity[i] <= 0:
+            equity[i] = 0
+            equity[i:] = 0
+            break
+
+    # Close final trade if still open
+    if in_trade:
+        if current_trade_pnl > 0:
+            winning_trades += 1
+        else:
+            losing_trades += 1
 
     # Calculate metrics
-    num_trades = trades.sum()
-
-    if num_trades == 0:
-        return {
-            "strategy": strategy_name,
-            "return_pct": 0.0,
-            "sharpe_ratio": 0.0,
-            "max_drawdown_pct": 0.0,
-            "win_rate_pct": 0.0,
-            "num_trades": 0,
-            "final_equity": config.INITIAL_CASH,
-        }
-
-    # Equity curve
-    equity = (1 + net_returns).cumprod() * config.INITIAL_CASH
-    final_equity = equity.iloc[-1]
+    final_equity = equity[-1]
     total_return = (final_equity / config.INITIAL_CASH - 1) * 100
 
-    # Sharpe ratio
-    if net_returns.std() > 0:
+    # Sharpe from equity curve
+    equity_returns = np.diff(equity) / equity[:-1]
+    equity_returns = equity_returns[equity_returns != 0]
+    if len(equity_returns) > 1 and np.std(equity_returns) > 0:
         sharpe = (
-            net_returns.mean() / net_returns.std() * np.sqrt(252 * 24 * 60)
-        )  # Annualized for 1-min data
+            np.mean(equity_returns)
+            / np.std(equity_returns)
+            * np.sqrt(min(252, len(equity_returns)))
+        )
     else:
         sharpe = 0.0
 
-    # Max drawdown
-    cummax = equity.cummax()
-    drawdown = (equity - cummax) / cummax * 100
-    max_dd = drawdown.min()
-
-    # Win rate - calculate on position returns, not just trade points
-    position_returns = strat_returns[position != 0]
-    if len(position_returns) > 0:
-        win_rate = (position_returns > 0).sum() / len(position_returns) * 100
+    # Max drawdown from equity curve
+    if len(equity) > 0:
+        cummax = np.maximum.accumulate(equity)
+        drawdown = (equity - cummax) / cummax * 100
+        max_dd = np.min(drawdown) if len(drawdown) > 0 else 0.0
     else:
-        win_rate = 0.0
+        max_dd = 0.0
+
+    # Win rate
+    total_closed_trades = winning_trades + losing_trades
+    win_rate = (
+        (winning_trades / total_closed_trades * 100) if total_closed_trades > 0 else 0.0
+    )
 
     return {
         "strategy": strategy_name,
@@ -182,9 +240,35 @@ def simple_vectorized_backtest(
         "sharpe_ratio": float(sharpe),
         "max_drawdown_pct": float(max_dd),
         "win_rate_pct": float(win_rate),
-        "num_trades": int(num_trades),
+        "num_trades": int(total_trades),
         "final_equity": float(final_equity),
     }
+
+
+def validate_backtest_results(results: list[dict]):
+    """Validate backtest results for unrealistic outcomes"""
+    warnings = []
+
+    for result in results:
+        strategy = result["strategy"]
+        ret = result["return_pct"]
+        sharpe = result["sharpe_ratio"]
+        num_trades = result["num_trades"]
+
+        if ret > 100:
+            warnings.append(f"{strategy}: Return {ret:.1f}% exceeds 100%")
+        if sharpe > 5:
+            warnings.append(f"{strategy}: Sharpe {sharpe:.1f} exceeds 5")
+        if num_trades > 0 and num_trades < 10:
+            warnings.append(f"{strategy}: Only {num_trades} trades")
+
+    if warnings:
+        print("\n" + "=" * 70)
+        print("BACKTEST VALIDATION WARNINGS")
+        print("=" * 70)
+        for warning in warnings:
+            print(f"  {warning}")
+        print("=" * 70 + "\n")
 
 
 def run_all_backtests(predictions: pd.DataFrame) -> list[dict]:
@@ -403,6 +487,9 @@ def run_backtesting():
 
     # Run backtests
     results = run_all_backtests(predictions)
+
+    # Validate results
+    validate_backtest_results(results)
 
     # Generate summary
     summary = generate_summary_report(results)

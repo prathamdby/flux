@@ -351,10 +351,16 @@ class EnhancedOFICollector:
             for i, ts in enumerate(self.price_timestamps):
                 if ts >= future_time:
                     time_diff = abs(ts - future_time)
-                    if time_diff < min_time_diff:
+                    if time_diff < min_time_diff and time_diff < 2.0:
                         min_time_diff = time_diff
                         future_price = self.price_history[i]
-                    break
+
+                        if ts <= current_time:
+                            future_price = None
+                            break
+
+                    if future_price is not None:
+                        break
 
             if future_price is not None and min_time_diff < 2.0:
                 price_return = (future_price - current_price) / current_price

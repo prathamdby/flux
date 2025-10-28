@@ -126,12 +126,13 @@ EARLY_STOPPING_ROUNDS = 50
 
 # Trading costs
 COMMISSION = 0.0005  # 5 bps per trade
+SLIPPAGE_BPS = 0.0002  # 2 bps slippage per trade
 
 # Initial capital
 INITIAL_CASH = 100_000
 
 # Position sizing
-POSITION_SIZE = 0.95
+POSITION_SIZE = 0.10  # 10% of capital per trade
 
 # Strategy parameters - adaptive thresholds based on prediction distribution
 STRATEGY_SCENARIOS = {
