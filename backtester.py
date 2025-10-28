@@ -70,7 +70,7 @@ def generate_predictions(
     X_test = test_df[feature_cols]
 
     predictions = pd.DataFrame()
-    predictions["mid"] = test_df["mid"].values
+    predictions["mid_price"] = test_df["mid_price"].values
     predictions["actual_return"] = test_df["forward_return_scaled"].values
 
     for quantile, model in models.items():
@@ -109,14 +109,14 @@ def simple_vectorized_backtest(
     elif strategy_name == "bollinger_simple":
         # Simplified Bollinger on mid price
         window = 20
-        sma = predictions["mid"].rolling(window).mean()
-        std = predictions["mid"].rolling(window).std()
+        sma = predictions["mid_price"].rolling(window).mean()
+        std = predictions["mid_price"].rolling(window).std()
         upper = sma + 2 * std
         lower = sma - 2 * std
 
         signals = pd.Series(0, index=predictions.index)
-        signals[predictions["mid"] > upper] = 1  # Breakout long
-        signals[predictions["mid"] < lower] = -1  # Breakout short
+        signals[predictions["mid_price"] > upper] = 1  # Breakout long
+        signals[predictions["mid_price"] < lower] = -1  # Breakout short
 
     else:
         signals = pd.Series(0, index=predictions.index)

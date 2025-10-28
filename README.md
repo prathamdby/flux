@@ -20,13 +20,13 @@ The system will continuously learn from market patterns, adapt to changing condi
 
 **Phase 1 - Data Collection:** ✅ Complete
 
-- Real-time BTC/USDT market data collection
-- Configurable aggregation windows (default: 60s bars)
-- Configurable forward return labels (default: 300s)
+- Real-time BTC/USDT market data collection via WebSocket (~100ms tick-by-tick)
+- Multiple forward return timeframes (5s, 10s, 30s) for short-term predictions
+- Enhanced microstructure features (microprice edge, VPIN toxicity, quote churn)
 - All matured samples saved (filtering done in ML pipeline)
-- Output: CSV format with parallel writer thread
-- Quality statistics tracking for monitoring collection effectiveness
-- Robust Binance depth stream synchronization with stale watchdog
+- Output: CSV format with automatic forward return backfilling
+- Real-time quality statistics and periodic status updates
+- Robust Binance depth stream synchronization with auto-reconnection
 
 **Phase 2 - ML Pipeline:** ✅ Complete
 
@@ -67,18 +67,23 @@ python data_collector.py
 
 **Configuration Options** (edit top of `data_collector.py`):
 
-- `WINDOW_SEC` - Aggregation window (default: 30s for 30-second bars)
-- `FORWARD_WINDOW_SEC` - Forward return horizon (default: 180s for 3-minute labels)
-- `MIN_PRICE_MOVEMENT` - Minimum return for quality tracking (default: 0.001%)
-- `FILTER_ZERO_MOVEMENT` - Disabled (all matured rows saved; filter in ML pipeline)
+- `OFI_DEPTH_LEVELS` - Order book depth for OFI calculation (default: 15 levels)
+- `RETURN_TIMEFRAMES` - Forward return horizons (default: [5, 10, 30] seconds)
+- `OFI_ZSCORE_WINDOW` - Lookback window for OFI normalization (default: 200)
+- `SAVE_INTERVAL_SECONDS` - How often to save data (default: 60s)
 
-**Output:** `flux_data.csv` with HFT metrics:
+**Target Configuration** (edit `config.py`):
 
-- **Market Data:** Mid price, spread, bid/ask depth
-- **HFT Metrics:** OFI, VPIN, microprice, tick momentum
-- **Flow Metrics:** Trade volume, direction, churn, cancel rates
-- **ML Targets:** Forward returns, directional labels
-- **Quality Stats:** Real-time tracking of data movement percentage
+- `TARGET_TIMEFRAME` - Which return to use for training (default: "return_10s")
+
+**Output:** `flux_data.csv` with enhanced HFT metrics:
+
+- **Price Features:** Mid price, microprice, microprice edge, spread (raw & bps)
+- **OFI Features:** Multi-level weighted OFI, velocity, acceleration, z-score
+- **Depth Features:** Depth imbalance, total volume
+- **Microstructure Features:** Quote churn, VPIN toxicity, tick direction & momentum
+- **Market Regime:** Realized volatility
+- **ML Targets:** Forward returns at 5s, 10s, 30s horizons
 
 ### Phase 2: ML Pipeline
 
@@ -105,6 +110,7 @@ python flux_ml_pipeline.py cleanup   # Remove all generated files
 Edit `config.py` to customize:
 
 - Train/val/test split ratios
+- Target timeframe selection (return_5s, return_10s, or return_30s)
 - LightGBM hyperparameters
 - Quantile levels (default: 0.1, 0.5, 0.9)
 - Trading costs (default: 5 bps)
@@ -142,9 +148,12 @@ Flux uses **quantile regression** instead of traditional point predictions becau
 
 Based on LOB microstructure research ([Briola et al., 2024](https://arxiv.org/html/2403.09267v3)):
 
-- **Order Flow Imbalance (OFI):** Multi-level weighted depth changes
-- **VPIN:** Volume-synchronized informed trading probability
-- **Microstructure Features:** Spread-volatility ratios, depth imbalance, trade pressure
+- **Order Flow Imbalance (OFI):** Multi-level weighted depth changes with velocity & acceleration
+- **VPIN Toxicity:** Volume-synchronized informed trading probability
+- **Quote Churn:** Order cancellation rate proxy for market toxicity
+- **Microprice Features:** Volume-weighted mid price and edge calculations
+- **Tick Dynamics:** Direction and momentum from microprice movements
+- **Microstructure Interactions:** OFI-VPIN, depth-weighted OFI, toxicity-volatility
 - **Temporal Features:** Lag features and rolling statistics for pattern detection
 
 ### Backtesting Strategies
@@ -165,14 +174,16 @@ All strategies include realistic transaction costs (5 bps) and clear, non-techni
 
 ## Key Features
 
-✅ **Configurable Timeframes:** Adjustable aggregation windows (1s to 5min+)  
-✅ **Robust Data Collection:** Parallel CSV writer with periodic fsync, minimal data loss  
-✅ **Advanced Metrics:** Multi-level OFI, VPIN, microprice edge  
-✅ **Production-Ready:** Async architecture, stale watchdog, auto-reconnection, proper Binance sync  
-✅ **Cost-Aware:** Transaction costs baked into backtesting  
-✅ **Interpretable:** Feature importance analysis and plain-language reports  
-✅ **Multi-Strategy:** Test multiple approaches simultaneously  
-✅ **Real-time Monitoring:** Quality statistics during collection
+✅ **Tick-by-Tick Data:** High-frequency order book updates (~100ms resolution)
+✅ **Multiple Prediction Horizons:** Train on 5s, 10s, or 30s forward returns
+✅ **Enhanced Microstructure Features:** Microprice edge, quote churn, VPIN toxicity
+✅ **Robust Data Collection:** Automatic backfilling, periodic saves, minimal data loss
+✅ **Advanced Metrics:** Multi-level OFI, tick direction momentum, depth imbalance
+✅ **Production-Ready:** Auto-reconnection, proper Binance sync, error handling
+✅ **Cost-Aware:** Transaction costs baked into backtesting
+✅ **Interpretable:** Feature importance analysis and plain-language reports
+✅ **Multi-Strategy:** Test multiple approaches simultaneously
+✅ **Real-time Monitoring:** Status updates during collection
 
 ## Contributing
 

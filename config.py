@@ -61,10 +61,12 @@ TEST_RATIO = 0.15
 
 # Features to use for modeling (exclude targets and metadata)
 EXCLUDE_FEATURES = [
-    "ts",
-    "forward_return_5s",
+    "timestamp",
+    "datetime",
+    "return_5s",
+    "return_10s",
+    "return_30s",
     "forward_return_scaled",
-    "target_direction",
     "price_moved",
 ]
 
@@ -92,6 +94,9 @@ MIN_ABSOLUTE_RETURN = 1e-07  # Only train on samples with actual movement
 
 # Target variable
 TARGET = "forward_return_scaled"  # Use scaled version
+TARGET_TIMEFRAME = (
+    "return_10s"  # Which forward return to use: return_5s, return_10s, or return_30s
+)
 
 # Quantile regression quantiles
 QUANTILES = [0.1, 0.5, 0.9]

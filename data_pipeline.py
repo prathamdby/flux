@@ -72,11 +72,13 @@ def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
 def scale_and_filter_targets(df: pd.DataFrame) -> pd.DataFrame:
     """Scale returns and mark samples with actual price movement"""
     # Scale returns to make them workable (1e6 multiplier)
-    df["forward_return_scaled"] = df["forward_return_5s"] * config.RETURN_SCALE_FACTOR
+    df["forward_return_scaled"] = (
+        df[config.TARGET_TIMEFRAME] * config.RETURN_SCALE_FACTOR
+    )
 
     # Mark samples with actual price movement
     df["price_moved"] = (
-        df["forward_return_5s"].abs() > config.MIN_ABSOLUTE_RETURN
+        df[config.TARGET_TIMEFRAME].abs() > config.MIN_ABSOLUTE_RETURN
     ).astype(int)
 
     moved_pct = df["price_moved"].mean()
@@ -85,9 +87,10 @@ def scale_and_filter_targets(df: pd.DataFrame) -> pd.DataFrame:
         print(f"   - Target scaled (1e6x) - {moved_pct:.1%} have price movement")
     else:
         print(f"\nScaling targets...")
+        print(f"   Using target: {config.TARGET_TIMEFRAME}")
         print(f"   Scaled returns by {config.RETURN_SCALE_FACTOR:,}x")
         print(f"   Samples with movement: {moved_pct:.2%}")
-        print(f"   Original mean: {df['forward_return_5s'].mean():.2e}")
+        print(f"   Original mean: {df[config.TARGET_TIMEFRAME].mean():.2e}")
         print(f"   Scaled mean: {df['forward_return_scaled'].mean():.4f}")
 
     return df
@@ -103,9 +106,9 @@ def engineer_lag_features(df: pd.DataFrame) -> pd.DataFrame:
 
     lag_features = [
         "ofi",
-        "ofi_vel",
-        "vpin",
-        "balance",
+        "ofi_velocity",
+        "vpin_toxicity",
+        "depth_imbalance",
         "tick_momentum",
         "spread_bps",
         "volatility",
@@ -133,7 +136,13 @@ def engineer_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     if config.VERBOSE:
         print("\nEngineering rolling features...")
 
-    rolling_features = ["ofi", "vpin", "volatility", "spread_bps", "tick_momentum"]
+    rolling_features = [
+        "ofi",
+        "vpin_toxicity",
+        "volatility",
+        "spread_bps",
+        "tick_momentum",
+    ]
 
     for feature in rolling_features:
         if feature in df.columns:
@@ -158,31 +167,29 @@ def engineer_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
     if config.VERBOSE:
         print("\nEngineering microstructure features...")
 
-    # OFI acceleration ratio
-    df["ofi_acc_ratio"] = df["ofi_acc"] / (df["ofi_vel"].abs() + 1e-8)
+    # OFI acceleration ratio (velocity/acceleration relationship)
+    df["ofi_acc_ratio"] = df["ofi_acceleration"] / (df["ofi_velocity"].abs() + 1e-8)
 
-    # Depth imbalance
-    df["depth_imbalance"] = (df["bid_depth"] - df["ask_depth"]) / (
-        df["bid_depth"] + df["ask_depth"] + 1e-8
-    )
-
-    # Trade pressure
-    df["trade_pressure"] = (df["tick_up"] - df["tick_dn"]) / (df["trade_count"] + 1)
-
-    # Spread-volatility ratio
+    # Spread-volatility ratio (liquidity vs volatility)
     df["spread_vol_ratio"] = df["spread_bps"] / (df["volatility"] + 1e-8)
 
     # Microprice momentum
     df["microprice_momentum"] = df["microprice_edge"].rolling(5).mean()
 
-    # VPIN-OFI interaction
-    df["vpin_ofi_interaction"] = df["vpin"] * df["ofi_z"]
+    # VPIN-OFI interaction (toxicity + order flow)
+    df["vpin_ofi_interaction"] = df["vpin_toxicity"] * df["ofi_zscore"]
 
-    # Volume-weighted OFI
-    df["volume_weighted_ofi"] = df["ofi"] * df["trade_vol"]
+    # Quote churn momentum (cancellation patterns)
+    df["quote_churn_momentum"] = df["quote_churn"].rolling(10).mean()
 
-    # Cancel rate momentum
-    df["cancel_rate_momentum"] = df["cancel_rate"].rolling(10).mean()
+    # Tick pressure (directional momentum strength)
+    df["tick_pressure"] = df["tick_direction"] * df["tick_momentum"]
+
+    # Depth-weighted OFI (imbalance + order flow)
+    df["depth_weighted_ofi"] = df["ofi"] * df["depth_imbalance"]
+
+    # Toxicity-volatility interaction
+    df["toxicity_vol_interaction"] = df["vpin_toxicity"] * df["volatility"]
 
     if config.VERBOSE:
         print(f"   Created 8 advanced microstructure features")

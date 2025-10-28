@@ -9,815 +9,511 @@ and trade data. Computes high-frequency trading metrics including:
 - Volume-Synchronized Probability of Informed Trading (VPIN)
 - Microprice and spread metrics
 - Trade tick momentum and directional flow
-- Forward returns for ML model training
+- Forward returns for ML model training (5s, 10s, 30s timeframes)
 
 Part of the Flux end-to-end algorithmic trading system.
 """
 
-import asyncio
-import csv
-import io
-import json
-import math
-import os
-import queue
-import threading
 import time
+import json
+import os
+from datetime import datetime
 from collections import deque
-from pathlib import Path
-
+import websocket
+import threading
 import numpy as np
-import requests
-import websockets
-from sortedcontainers import SortedDict
+import pandas as pd
 
-SYMBOL = "BTCUSDT"
-# Extract base by removing quote currency suffix
-SYMBOL_BASE = SYMBOL.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
-DEPTH_WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@depth20@100ms"
-TRADE_WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@aggTrade"
-SNAPSHOT_URL = f"https://fapi.binance.com/fapi/v1/depth?symbol={SYMBOL}&limit=1000"
-OUT_CSV = "flux_data.csv"
-CSV_FIELDNAMES = [
-    "ts",
-    "mid",
-    "spread",
-    "spread_bps",
-    "micro",
-    "microprice_edge",
-    "ofi",
-    "ofi_vel",
-    "ofi_acc",
-    "ofi_z",
-    "bid_depth",
-    "ask_depth",
-    "balance",
-    "trade_vol",
-    "trade_count",
-    "tick_up",
-    "tick_dn",
-    "tick_momentum",
-    "churn",
-    "cancel_rate",
-    "vpin",
-    "volatility",
-    "forward_return_5s",
-    "target_direction",
-]
+# ===== CONFIGURATION =====
 
-# ========== CONFIGURABLE WINDOWS ==========
-# Recommendation: Use 30s bars with 180s forward for better signal quality
-WINDOW_SEC = 30.0  # 30-second bars
-FORWARD_WINDOW_SEC = 180.0  # 3-minute forward
+# Data Storage
+CSV_FILENAME = "flux_data.csv"
 
-# ========== DATA QUALITY FILTERS ==========
-# Track quality stats but save all matured rows (filtering done in ML pipeline)
-MIN_PRICE_MOVEMENT = 0.00001  # Minimum |return| for quality tracking (0.001%)
-FILTER_ZERO_MOVEMENT = False  # Always save all matured rows
+# OFI Parameters
+OFI_DEPTH_LEVELS = 15
+OFI_HISTORY_SIZE = 500
+OFI_ZSCORE_WINDOW = 200
 
-OFI_DEPTH_LEVELS = 15  # Multi-level OFI calculation depth
+# Return Calculation Timeframes (focused on short-term)
+RETURN_TIMEFRAMES = [5, 10, 30]  # 5s, 10s, 30s - where signal is strongest
 
-# Retry & resilience config
-RETRY_BACKOFF_BASE = 1.0  # Start with 1 second
-RETRY_BACKOFF_MAX = 30.0  # Cap at 30 seconds
-STALE_CONNECTION_TIMEOUT = 60.0  # Reconnect if no data for 60s
+# Binance WebSocket
+WS_URL = "wss://fstream.binance.com/ws/btcusdt@depth20@100ms"
 
-# CSV writer config
-FSYNC_EVERY_N_BATCHES = 10  # fsync to disk every N batches
-MATURATION_FLUSH_INTERVAL = 3.0  # Check for matured rows every N seconds
+# Data Collection Settings
+SAVE_INTERVAL_SECONDS = 60
+PRINT_INTERVAL_SECONDS = 300
 
-# Logging config
-VERBOSE_LOGGING = True
-last_log_time = 0
-trade_message_count = 0
-depth_message_count = 0
-start_time = 0  # Track when script started
-
-# Health monitoring
-last_depth_msg_time = 0
-last_trade_msg_time = 0
-
-# Data quality statistics
-samples_collected = 0
-samples_with_movement = 0
-total_price_change = 0.0
-
-# rolling buffers
-ROLL_N = 100
-ofi_roll = deque(maxlen=ROLL_N)
-velocity_roll = deque(maxlen=ROLL_N)
-mid_roll = deque(maxlen=ROLL_N)
-trade_tick_history = deque(maxlen=50)
-microprice_history = deque(maxlen=100)
-
-# forward return buffer - stores recent rows with timestamp and mid price
-forward_buffer = deque(maxlen=1000)
-
-# window accumulators
-trade_vol_window = 0.0
-trade_count_window = 0
-trade_dir_counts = {"+1": 0, "0": 0, "-1": 0}
-quote_churn = 0.0
-cancel_count = 0
-update_count = 0
-prev_ofi = 0.0
-prev_velocity = 0.0
-prev_mid = None
-prev_trade_price = None
-
-# simple VPIN
-VPIN_BUCKETS = 10
-vpin_bucket_vol = [0.0] * VPIN_BUCKETS
-vpin_bucket_imb = [0.0] * VPIN_BUCKETS
-vpin_cur_bucket = 0
-vpin_bucket_target = 1.0
-
-# shared state between websockets
-bids = SortedDict()
-asks = SortedDict()
-lastUpdateId = 0
-write_queue = None
-csv_writer_thread = None
+# ===== ENHANCED OFI COLLECTOR =====
 
 
-def get_elapsed_time():
-    """Get formatted elapsed time since script start (human-readable)"""
-    if start_time == 0:
-        return "0s"
-    elapsed = int(time.time() - start_time)
-    hours = elapsed // 3600
-    minutes = (elapsed % 3600) // 60
-    seconds = elapsed % 60
-
-    parts = []
-    if hours > 0:
-        parts.append(f"{hours}h")
-    if minutes > 0:
-        parts.append(f"{minutes}m")
-    if seconds > 0 or not parts:
-        parts.append(f"{seconds}s")
-
-    return " ".join(parts)
-
-
-async def retry_with_backoff(coro_func, name, *args, **kwargs):
-    """Retry a coroutine with exponential backoff on failure"""
-    attempt = 0
-    while True:
-        try:
-            await coro_func(*args, **kwargs)
-            # If we get here, connection ended normally (shouldn't happen in infinite loop)
-            print(f"\n{name} ended unexpectedly, reconnecting...")
-        except asyncio.CancelledError:
-            print(f"\n{name} cancelled, shutting down...")
-            raise  # Propagate cancellation
-        except Exception as e:
-            attempt += 1
-            backoff = min(RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX)
-            print(f"\n{name} failed: {e}")
-            print(f"Reconnecting in {backoff:.1f}s (attempt #{attempt})...")
-            await asyncio.sleep(backoff)
-            # Reset counter on successful connection (will be set by next iteration)
-            if attempt > 5:
-                attempt = 0  # Reset after sustained failures to avoid huge backoffs
-
-
-def calculate_weighted_ofi(bids: SortedDict, asks: SortedDict):
+class EnhancedOFICollector:
     """
-    Calculate multi-level weighted OFI from order book depth.
-    Weights decay by 1/(level+1) to emphasize top-of-book while capturing depth.
+    Collects comprehensive OFI data with ML-focused features:
+    - Microprice
+    - Quote churn
+    - VPIN toxicity
+    - Spread percentiles
+    - Tick direction
     """
-    weighted_ofi = 0.0
-    level = 0
 
-    bid_iter = bids.irange(reverse=True)
-    ask_iter = asks.irange()
+    def __init__(self):
+        self.ws_url = WS_URL
+        self.ws = None
+        self.ws_thread = None
+        self.running = False
 
-    for bid_price, ask_price in zip(bid_iter, ask_iter):
-        if level >= OFI_DEPTH_LEVELS:
-            break
-        weight = 1.0 / (level + 1)
-        bid_qty = bids.get(bid_price, 0.0)
-        ask_qty = asks.get(ask_price, 0.0)
-        weighted_ofi += (bid_qty - ask_qty) * weight
-        level += 1
+        # Orderbook state
+        self.prev_bids = []
+        self.prev_asks = []
+        self.current_bids = []
+        self.current_asks = []
 
-    return weighted_ofi
+        # OFI tracking
+        self.ofi_history = deque(maxlen=OFI_HISTORY_SIZE)
+        self.volume_history = deque(maxlen=OFI_HISTORY_SIZE)
+        self.timestamp_history = deque(maxlen=OFI_HISTORY_SIZE)
 
+        # Price tracking
+        self.price_history = deque(maxlen=5000)
+        self.price_timestamps = deque(maxlen=5000)
+        self.microprice_history = deque(maxlen=500)
 
-class CSVWriter(threading.Thread):
-    """Thread-safe CSV writer that appends rows with periodic fsync"""
+        # Tick direction tracking
+        self.tick_direction_history = deque(maxlen=100)
 
-    def __init__(self, filepath, fieldnames):
-        super().__init__(daemon=True)
-        self.filepath = filepath
-        self.fieldnames = fieldnames
-        self.queue = queue.Queue()
-        self.batch_count = 0
-        self.total_written = 0
+        # Quote churn tracking (for toxicity)
+        self.bid_updates = deque(maxlen=100)
+        self.ask_updates = deque(maxlen=100)
+        self.trade_imbalance_history = deque(maxlen=100)
+
+        # Current metrics
+        self.latest_ofi = 0
+        self.latest_ofi_velocity = 0
+        self.latest_ofi_acceleration = 0
+        self.latest_ofi_zscore = 0
+        self.latest_volume = 0
+        self.latest_mid_price = 0
+        self.latest_microprice = 0
+        self.latest_spread = 0
+        self.latest_spread_bps = 0
+        self.latest_depth_imbalance = 0
+        self.latest_volatility = 0
+        self.latest_quote_churn = 0
+        self.latest_vpin = 0
+        self.latest_tick_direction = 0
+
+        # Data collection buffer
+        self.collected_data = []
+        self.last_save_time = time.time()
+        self.last_print_time = time.time()
+        self.total_records = 0
+
+    def start(self):
+        """Start WebSocket connection"""
         self.running = True
 
-    def run(self):
-        """Main writer loop running in background thread"""
-        file_exists = os.path.exists(self.filepath)
-        consecutive_errors = 0
-        max_consecutive_errors = 5
+        def on_open(ws):
+            print("WebSocket connected - Flux data collection active")
 
-        with open(self.filepath, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=self.fieldnames, extrasaction="ignore"
-            )
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                bids = data.get("b", [])
+                asks = data.get("a", [])
 
-            # Write header if file is empty
-            if not file_exists or os.path.getsize(self.filepath) == 0:
-                writer.writeheader()
-                f.flush()
+                if not bids or not asks:
+                    return
 
-            while self.running:
-                try:
-                    rows = self.queue.get(timeout=1.0)
-                    if rows is None:  # Shutdown signal
-                        break
+                self.current_bids = [
+                    (float(p), float(q)) for p, q in bids[:OFI_DEPTH_LEVELS]
+                ]
+                self.current_asks = [
+                    (float(p), float(q)) for p, q in asks[:OFI_DEPTH_LEVELS]
+                ]
 
-                    # Write batch
-                    for row in rows:
-                        writer.writerow(row)
-                        self.total_written += 1
+                # Calculate prices
+                if self.current_bids and self.current_asks:
+                    current_time = time.time()
 
-                    f.flush()
-                    self.batch_count += 1
+                    # Mid price
+                    mid_price = (self.current_bids[0][0] + self.current_asks[0][0]) / 2
+                    self.price_history.append(mid_price)
+                    self.price_timestamps.append(current_time)
+                    self.latest_mid_price = mid_price
 
-                    # Periodic fsync to disk
-                    if self.batch_count % FSYNC_EVERY_N_BATCHES == 0:
-                        os.fsync(f.fileno())
-
-                    self.queue.task_done()
-                    consecutive_errors = 0  # Reset on success
-
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    consecutive_errors += 1
-                    print(
-                        f"❌ CSV writer error ({consecutive_errors}/{max_consecutive_errors}): {e}"
+                    # Spread
+                    self.latest_spread = (
+                        self.current_asks[0][0] - self.current_bids[0][0]
                     )
+                    self.latest_spread_bps = (self.latest_spread / mid_price) * 10000
 
-                    if consecutive_errors >= max_consecutive_errors:
-                        print(
-                            f"❌ CRITICAL: CSV writer failed {max_consecutive_errors} times - shutting down"
+                    # Microprice (volume-weighted mid)
+                    bid_vol = self.current_bids[0][1]
+                    ask_vol = self.current_asks[0][1]
+                    microprice = (
+                        self.current_bids[0][0] * ask_vol
+                        + self.current_asks[0][0] * bid_vol
+                    ) / (bid_vol + ask_vol)
+                    self.latest_microprice = microprice
+                    self.microprice_history.append(microprice)
+
+                    # Tick direction (microprice vs mid)
+                    if len(self.microprice_history) >= 2:
+                        tick_dir = (
+                            1
+                            if self.microprice_history[-1] > self.microprice_history[-2]
+                            else -1
                         )
-                        import traceback
+                        self.tick_direction_history.append(tick_dir)
+                        self.latest_tick_direction = tick_dir
 
-                        traceback.print_exc()
-                        break
+                # Calculate OFI metrics if we have previous data
+                if self.prev_bids and self.prev_asks:
+                    ofi = self.calculate_multi_level_ofi()
+                    volume = self.calculate_total_volume()
 
-                    # Re-queue the batch for retry (if rows is defined)
-                    try:
-                        if "rows" in locals() and rows:
-                            self.queue.put(rows)
-                            print(f"   Re-queued {len(rows)} rows for retry")
-                    except:
-                        pass
+                    self.ofi_history.append(ofi)
+                    self.volume_history.append(volume)
+                    self.timestamp_history.append(time.time())
 
-                    time.sleep(1)  # Backoff before retry
-                    continue
+                    # Track quote updates for churn
+                    self.track_quote_updates()
 
-    def write_rows(self, rows):
-        """Non-blocking enqueue of rows"""
-        self.queue.put(rows)
+                    if len(self.ofi_history) >= 3:
+                        self.latest_ofi = ofi
+                        self.latest_ofi_velocity = self.calculate_ofi_velocity()
+                        self.latest_ofi_acceleration = self.calculate_ofi_acceleration()
+                        self.latest_ofi_zscore = self.calculate_ofi_zscore()
+                        self.latest_volume = volume
+                        self.latest_depth_imbalance = self.calculate_depth_imbalance()
+                        self.latest_volatility = self.calculate_volatility()
+                        self.latest_quote_churn = self.calculate_quote_churn()
+                        self.latest_vpin = self.calculate_vpin()
 
-    def shutdown(self):
-        """Graceful shutdown: drain queue and stop"""
-        self.queue.put(None)
-        self.join(timeout=10.0)
+                        # Collect data point
+                        self.collect_data_point()
+
+                self.prev_bids = self.current_bids.copy()
+                self.prev_asks = self.current_asks.copy()
+
+            except Exception as e:
+                print(f"Calculation error: {e}")
+
+        def on_error(ws, error):
+            pass
+
+        def on_close(ws, code, msg):
+            if self.running and code != 1000:
+                time.sleep(2)
+                self.start()
+
+        self.ws = websocket.WebSocketApp(
+            self.ws_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+
+        self.ws_thread = threading.Thread(
+            target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=20),
+            daemon=True,
+        )
+        self.ws_thread.start()
+
+    def calculate_multi_level_ofi(self):
+        """Multi-level weighted OFI"""
+        weighted_ofi = 0.0
+        for level in range(
+            min(len(self.current_bids), len(self.current_asks), OFI_DEPTH_LEVELS)
+        ):
+            bid_qty = (
+                self.current_bids[level][1] if level < len(self.current_bids) else 0
+            )
+            ask_qty = (
+                self.current_asks[level][1] if level < len(self.current_asks) else 0
+            )
+            weight = 1.0 / (level + 1)
+            level_ofi = bid_qty - ask_qty
+            weighted_ofi += level_ofi * weight
+        return weighted_ofi
+
+    def calculate_total_volume(self):
+        """Calculate total volume"""
+        bid_volume = sum(qty for _, qty in self.current_bids)
+        ask_volume = sum(qty for _, qty in self.current_asks)
+        return bid_volume + ask_volume
+
+    def calculate_ofi_velocity(self):
+        """1st derivative of OFI"""
+        if len(self.ofi_history) < 2:
+            return 0
+        return self.ofi_history[-1] - self.ofi_history[-2]
+
+    def calculate_ofi_acceleration(self):
+        """2nd derivative of OFI"""
+        if len(self.ofi_history) < 3:
+            return 0
+        velocity_now = self.ofi_history[-1] - self.ofi_history[-2]
+        velocity_prev = self.ofi_history[-2] - self.ofi_history[-3]
+        return velocity_now - velocity_prev
+
+    def calculate_ofi_zscore(self):
+        """Z-score of OFI"""
+        lookback = min(OFI_ZSCORE_WINDOW, len(self.ofi_history))
+        if lookback < 10:
+            return 0
+        recent_ofi = list(self.ofi_history)[-lookback:]
+        mean = np.mean(recent_ofi)
+        std = np.std(recent_ofi)
+        return (self.latest_ofi - mean) / std if std > 0 else 0
+
+    def calculate_depth_imbalance(self):
+        """Bid/ask depth imbalance"""
+        if not self.current_bids or not self.current_asks:
+            return 0
+        bid_depth = sum(qty for _, qty in self.current_bids)
+        ask_depth = sum(qty for _, qty in self.current_asks)
+        return (
+            (bid_depth - ask_depth) / (bid_depth + ask_depth)
+            if (bid_depth + ask_depth) > 0
+            else 0
+        )
+
+    def calculate_volatility(self):
+        """Realized volatility"""
+        if len(self.price_history) < 60:
+            return 0
+        prices = list(self.price_history)[-60:]
+        returns = [
+            (prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))
+        ]
+        return np.std(returns) * np.sqrt(len(returns))
+
+    def track_quote_updates(self):
+        """Track quote updates for churn calculation"""
+        # Count how many levels changed
+        bid_changes = 0
+        ask_changes = 0
+
+        for i in range(min(5, len(self.current_bids), len(self.prev_bids))):
+            if i < len(self.current_bids) and i < len(self.prev_bids):
+                if (
+                    self.current_bids[i][0] != self.prev_bids[i][0]
+                    or abs(self.current_bids[i][1] - self.prev_bids[i][1]) > 0.001
+                ):
+                    bid_changes += 1
+
+        for i in range(min(5, len(self.current_asks), len(self.prev_asks))):
+            if i < len(self.current_asks) and i < len(self.prev_asks):
+                if (
+                    self.current_asks[i][0] != self.prev_asks[i][0]
+                    or abs(self.current_asks[i][1] - self.prev_asks[i][1]) > 0.001
+                ):
+                    ask_changes += 1
+
+        self.bid_updates.append(bid_changes)
+        self.ask_updates.append(ask_changes)
+
+    def calculate_quote_churn(self):
+        """Quote churn rate (cancellation rate proxy)"""
+        if len(self.bid_updates) < 10:
+            return 0
+        recent_updates = list(self.bid_updates)[-20:] + list(self.ask_updates)[-20:]
+        return np.mean(recent_updates)
+
+    def calculate_vpin(self):
+        """Volume-synchronized Probability of Informed Trading (VPIN)"""
+        if len(self.ofi_history) < 50:
+            return 0
+
+        # Use OFI as proxy for buy/sell volume imbalance
+        recent_ofi = list(self.ofi_history)[-50:]
+        buy_volume = sum(abs(x) for x in recent_ofi if x > 0)
+        sell_volume = sum(abs(x) for x in recent_ofi if x < 0)
+        total_volume = buy_volume + sell_volume
+
+        if total_volume == 0:
+            return 0
+
+        vpin = abs(buy_volume - sell_volume) / total_volume
+        return vpin
+
+    def calculate_forward_returns(self, current_time, current_price):
+        """Calculate forward returns for multiple timeframes"""
+        returns = {}
+        for timeframe in RETURN_TIMEFRAMES:
+            future_time = current_time + timeframe
+            future_price = None
+            min_time_diff = float("inf")
+
+            for i, ts in enumerate(self.price_timestamps):
+                if ts >= future_time:
+                    time_diff = abs(ts - future_time)
+                    if time_diff < min_time_diff:
+                        min_time_diff = time_diff
+                        future_price = self.price_history[i]
+                    break
+
+            if future_price is not None and min_time_diff < 2.0:
+                price_return = (future_price - current_price) / current_price
+                returns[f"return_{timeframe}s"] = price_return
+            else:
+                returns[f"return_{timeframe}s"] = None
+
+        return returns
+
+    def collect_data_point(self):
+        """Collect enhanced data point"""
+        current_time = time.time()
+
+        # Calculate tick direction momentum
+        tick_momentum = (
+            sum(self.tick_direction_history) / len(self.tick_direction_history)
+            if len(self.tick_direction_history) > 0
+            else 0
+        )
+
+        record = {
+            "timestamp": current_time,
+            "datetime": datetime.now().isoformat(),
+            # Price features
+            "mid_price": self.latest_mid_price,
+            "microprice": self.latest_microprice,
+            "microprice_edge": self.latest_microprice - self.latest_mid_price,
+            "spread": self.latest_spread,
+            "spread_bps": self.latest_spread_bps,
+            # OFI features
+            "ofi": self.latest_ofi,
+            "ofi_zscore": self.latest_ofi_zscore,
+            "ofi_velocity": self.latest_ofi_velocity,
+            "ofi_acceleration": self.latest_ofi_acceleration,
+            # Depth features
+            "depth_imbalance": self.latest_depth_imbalance,
+            "volume": self.latest_volume,
+            # Market microstructure features
+            "quote_churn": self.latest_quote_churn,
+            "vpin_toxicity": self.latest_vpin,
+            "tick_direction": self.latest_tick_direction,
+            "tick_momentum": tick_momentum,
+            # Market regime
+            "volatility": self.latest_volatility,
+        }
+
+        # Add forward returns
+        forward_returns = self.calculate_forward_returns(
+            current_time, self.latest_mid_price
+        )
+        record.update(forward_returns)
+
+        self.collected_data.append(record)
+
+        # Periodically save
+        if time.time() - self.last_save_time >= SAVE_INTERVAL_SECONDS:
+            self.save_data()
+            self.last_save_time = time.time()
+
+        # Periodically print status
+        if time.time() - self.last_print_time >= PRINT_INTERVAL_SECONDS:
+            self.print_status()
+            self.last_print_time = time.time()
+
+    def save_data(self):
+        """Save data to CSV"""
+        if not self.collected_data:
+            return
+
+        df = pd.DataFrame(self.collected_data)
+        self.backfill_forward_returns(df)
+
+        if os.path.exists(CSV_FILENAME):
+            df.to_csv(CSV_FILENAME, mode="a", header=False, index=False)
+        else:
+            df.to_csv(CSV_FILENAME, mode="w", header=True, index=False)
+
+        self.total_records += len(self.collected_data)
+        print(
+            f"FLUX - Saved {len(self.collected_data)} records | Total: {self.total_records:,}"
+        )
+
+        self.collected_data = []
+
+    def backfill_forward_returns(self, df):
+        """Backfill forward returns"""
+        for idx, row in df.iterrows():
+            if pd.notna(row["return_5s"]):
+                continue
+
+            record_time = row["timestamp"]
+            record_price = row["mid_price"]
+            forward_returns = self.calculate_forward_returns(record_time, record_price)
+
+            for key, value in forward_returns.items():
+                if value is not None:
+                    df.at[idx, key] = value
+
+    def print_status(self):
+        """Print collection status"""
+        print("\n" + "=" * 70)
+        print("  FLUX ALGORITHMIC TRADING SYSTEM")
+        print("  Market Data Collector - BTCUSDT")
+        print("=" * 70)
+        print(f"  Total records: {self.total_records:,}")
+        print(f"  Buffer: {len(self.collected_data)}")
+        print(
+            f"  Mid: ${self.latest_mid_price:,.2f} | Spread: {self.latest_spread_bps:.2f}bps"
+        )
+        print(f"  OFI: {self.latest_ofi:.2f} | Z: {self.latest_ofi_zscore:.2f}")
+        print(f"  Depth Imbalance: {self.latest_depth_imbalance:.4f}")
+        print(
+            f"  VPIN: {self.latest_vpin:.4f} | Quote Churn: {self.latest_quote_churn:.2f}"
+        )
+
+        hours_collected = self.total_records / 36000
+        print(f"  Coverage: {hours_collected:.2f} hours")
+        print("=" * 70 + "\n")
+
+    def stop(self):
+        """Stop and save"""
+        self.running = False
+        if self.ws:
+            self.ws.close()
+        if self.ws_thread:
+            self.ws_thread.join(timeout=2)
+        self.save_data()
 
 
 def print_banner():
     """Print Flux startup banner"""
     print("\n" + "=" * 70)
     print("  FLUX ALGORITHMIC TRADING SYSTEM")
-    print("  Market Data Collector - " + SYMBOL)
+    print("  Market Data Collector - BTCUSDT")
     print("=" * 70)
     print(f"  OFI, VPIN, microprice, spread, tick momentum")
-    print(f"  Output: {OUT_CSV} (CSV)")
-    print(f"  {WINDOW_SEC:.0f}s metrics | {FORWARD_WINDOW_SEC:.0f}s forward labels")
-    print(f"  All matured rows saved (filter applied in ML pipeline)")
+    print(f"  Output: {CSV_FILENAME}")
+    print(f"  Forward labels: 5s, 10s, 30s")
     print("=" * 70 + "\n")
 
 
-def log_stream_stats():
-    """Log stream health"""
-    global last_log_time, trade_message_count, depth_message_count
-    current_time = time.time()
+def main():
+    print_banner()
+    print("FLUX DATA COLLECTION ACTIVE (Ctrl+C to stop)\n")
 
-    if current_time - last_log_time >= 10:
-        print(
-            f"Stream: Depth {depth_message_count}/10s | Trades {trade_message_count}/10s"
-        )
-        last_log_time = current_time
-        trade_message_count = 0
-        depth_message_count = 0
-
-
-def ingest_update(delta, is_decrease):
-    global quote_churn, cancel_count, update_count
-    quote_churn += abs(delta)
-    update_count += 1
-    if is_decrease:
-        cancel_count += 1
-
-
-def ingest_trade(price, size):
-    global trade_vol_window, trade_count_window, prev_trade_price, trade_tick_history
-    trade_vol_window += size
-    trade_count_window += 1
-    if prev_trade_price is None:
-        d = 0
-        d_key = "0"
-    else:
-        if price > prev_trade_price:
-            d = 1
-            d_key = "+1"
-        elif price < prev_trade_price:
-            d = -1
-            d_key = "-1"
-        else:
-            d = 0
-            d_key = "0"
-    trade_dir_counts[d_key] += 1
-    prev_trade_price = price
-    trade_tick_history.append(d)
-    global vpin_cur_bucket, vpin_bucket_vol, vpin_bucket_imb, vpin_bucket_target
-    vpin_bucket_vol[vpin_cur_bucket] += size
-    vpin_bucket_imb[vpin_cur_bucket] += d * size
-    if vpin_bucket_vol[vpin_cur_bucket] >= vpin_bucket_target:
-        vpin_cur_bucket = (vpin_cur_bucket + 1) % VPIN_BUCKETS
-
-
-def reset_window():
-    global trade_vol_window, trade_count_window, trade_dir_counts, quote_churn, cancel_count, update_count
-    trade_vol_window = 0.0
-    trade_count_window = 0
-    trade_dir_counts = {"+1": 0, "0": 0, "-1": 0}
-    quote_churn = 0.0
-    cancel_count = 0
-    update_count = 0
-
-
-def collect_completed_rows():
-    global forward_buffer, samples_collected, samples_with_movement, total_price_change
-
-    if len(forward_buffer) < 2:
-        return []
-
-    current_time = time.time()
-    completed = []
-
-    for row in forward_buffer:
-        if row.get("_written"):
-            continue
-
-        row_time = row["ts"] / 1000.0
-        if current_time - row_time < FORWARD_WINDOW_SEC:
-            continue
-
-        if row["mid"] > 0 and row.get("forward_return_5s") is None:
-            target_time = row["ts"] + (FORWARD_WINDOW_SEC * 1000)
-            future_mid = None
-            for future_row in forward_buffer:
-                if future_row["ts"] >= target_time:
-                    future_mid = future_row["mid"]
-                    break
-
-            # Safe forward return calculation (guard against non-positive values)
-            if future_mid and future_mid > 0 and row["mid"] > 0:
-                forward_ret = math.log(future_mid / row["mid"])
-                row["forward_return_5s"] = forward_ret
-                row["target_direction"] = 1 if forward_ret > 0 else 0
-            else:
-                # Handle edge case where future_mid is invalid
-                forward_ret = 0.0
-                row["forward_return_5s"] = forward_ret
-                row["target_direction"] = 0
-
-        # Track quality statistics
-        samples_collected += 1
-        forward_ret = row.get("forward_return_5s", 0.0) or 0.0
-        abs_ret = abs(forward_ret)
-
-        if abs_ret > MIN_PRICE_MOVEMENT:
-            samples_with_movement += 1
-            total_price_change += abs_ret
-
-        # Always save all matured rows (no filtering)
-        completed.append(row)
-        row["_written"] = True
-
-    if len(completed) > 10:
-        cutoff_time = current_time - (FORWARD_WINDOW_SEC * 2)
-        forward_buffer[:] = [
-            row
-            for row in forward_buffer
-            if not row.get("_written") or (row["ts"] / 1000.0) > cutoff_time
-        ]
-
-    return completed
-
-
-def compute_metrics(ofi_acc):
-    global prev_ofi, prev_velocity, prev_mid, bids, asks
-
-    best_bid = bids.peekitem(-1)[0] if bids else 0
-    best_ask = asks.peekitem(0)[0] if asks else 0
-
-    if best_bid == 0 or best_ask == 0:
-        return None
-
-    weighted_ofi = calculate_weighted_ofi(bids, asks)
-    ofi_to_use = weighted_ofi
-
-    bid_size_top = bids.get(best_bid, 0.0)
-    ask_size_top = asks.get(best_ask, 0.0)
-    mid = (best_bid + best_ask) / 2
-    spread = abs(best_ask - best_bid)
-
-    spread_bps = (spread / mid) * 10000 if mid > 0 else 0
-
-    micro = (
-        (best_bid * ask_size_top + best_ask * bid_size_top)
-        / (bid_size_top + ask_size_top)
-        if (bid_size_top + ask_size_top) > 0
-        else mid
-    )
-
-    microprice_edge = micro - mid
-
-    microprice_history.append(micro)
-
-    tick_momentum = (
-        sum(trade_tick_history) / len(trade_tick_history)
-        if len(trade_tick_history) > 0
-        else 0
-    )
-
-    velocity = ofi_to_use - prev_ofi
-    acceleration = velocity - prev_velocity
-    ofi_roll.append(ofi_to_use)
-    velocity_roll.append(velocity)
-    prev_velocity = velocity
-    prev_ofi = ofi_to_use
-
-    ofi_z = None
-    if len(ofi_roll) >= 5:
-        ofi_array = np.fromiter(ofi_roll, dtype=np.float64)
-        mu = np.mean(ofi_array)
-        sd = np.std(ofi_array)
-        sd = sd if sd > 0 else 1.0
-        ofi_z = (ofi_to_use - mu) / sd
-
-    topN = 20
-    bid_depth = 0.0
-    ask_depth = 0.0
-
-    for level, price in enumerate(bids.irange(reverse=True)):
-        if level >= topN:
-            break
-        bid_depth += bids[price]
-
-    for level, price in enumerate(asks.irange()):
-        if level >= topN:
-            break
-        ask_depth += asks[price]
-    balance = (
-        (bid_depth - ask_depth) / (bid_depth + ask_depth)
-        if (bid_depth + ask_depth) > 0
-        else 0
-    )
-
-    churn = quote_churn
-    cancel_rate = cancel_count / update_count if update_count > 0 else 0
-
-    total_bucket_vol = sum(vpin_bucket_vol)
-    vpin = (
-        sum(abs(x) for x in vpin_bucket_imb) / total_bucket_vol
-        if total_bucket_vol > 0
-        else 0
-    )
-
-    mid_roll.append(mid)
-    vol = None
-    if len(mid_roll) >= 2:
-        mid_array = np.fromiter((m for m in mid_roll if m > 0), dtype=np.float64)
-        if len(mid_array) >= 2:
-            rets = np.log(mid_array[1:] / mid_array[:-1])
-            if rets.size > 1:
-                vol = float(np.std(rets))
-            elif rets.size == 1:
-                vol = float(abs(rets[0]))
-
-    ts = int(time.time() * 1000)
-    metrics = {
-        "ts": ts,
-        "mid": mid,
-        "spread": spread,
-        "spread_bps": spread_bps,
-        "micro": micro,
-        "microprice_edge": microprice_edge,
-        "ofi": ofi_to_use,
-        "ofi_vel": velocity,
-        "ofi_acc": acceleration,
-        "ofi_z": ofi_z,
-        "bid_depth": bid_depth,
-        "ask_depth": ask_depth,
-        "balance": balance,
-        "trade_vol": trade_vol_window,
-        "trade_count": trade_count_window,
-        "tick_up": trade_dir_counts["+1"],
-        "tick_dn": trade_dir_counts["-1"],
-        "tick_momentum": tick_momentum,
-        "churn": churn,
-        "cancel_rate": cancel_rate,
-        "vpin": vpin,
-        "volatility": vol,
-        "forward_return_5s": None,
-        "target_direction": None,
-    }
-    reset_window()
-    prev_mid = mid
-
-    # Add to forward buffer
-    forward_buffer.append(metrics.copy())
-
-    return metrics
-
-
-async def handle_depth_stream(ofi_acc_container, win_start_container):
-    """Handle order book depth updates with stale watchdog"""
-    global bids, asks, lastUpdateId, depth_message_count, last_depth_msg_time
-
-    print("Depth stream connecting...")
-
-    async with websockets.connect(
-        DEPTH_WS_URL, close_timeout=1, ping_interval=30, ping_timeout=10
-    ) as ws:
-        print("Depth stream live")
-        last_depth_msg_time = time.time()
-        synced = False  # Track if we've synced with snapshot
-
-        async for msg in ws:
-            # Update message tracking
-            depth_message_count += 1
-            last_depth_msg_time = time.time()
-
-            data = json.loads(msg)
-            U, u = data.get("U"), data.get("u")
-            if not (U and u):
-                continue
-
-            # Binance-compliant sync: wait for event bridging snapshot
-            if not synced:
-                # Drop old buffered events
-                if u <= lastUpdateId:
-                    continue
-                # Event must contain or follow lastUpdateId+1
-                if U <= lastUpdateId + 1 and u >= lastUpdateId + 1:
-                    synced = True
-                    print(
-                        f"Depth stream synced (U={U}, u={u}, lastUpdateId={lastUpdateId})"
-                    )
-                else:
-                    continue  # Buffer until sync
-            else:
-                # After sync, require contiguity
-                if U != lastUpdateId + 1:
-                    print(
-                        f"Depth gap detected (expected {lastUpdateId+1}, got {U}) - resyncing required"
-                    )
-                    raise Exception("Depth sequence gap - forcing resnapshot")
-
-            for price_s, qty_s in data.get("b", []):
-                price, qty = float(price_s), float(qty_s)
-
-                if qty == 0.0:
-                    old = bids.pop(price, 0.0)
-                    delta = -old
-                    is_decrease = old > 0
-                else:
-                    old = bids.get(price, 0.0)
-                    delta = qty - old
-                    is_decrease = qty < old
-                    if delta != 0:
-                        bids[price] = qty
-
-                ofi_acc_container[0] += delta
-                ingest_update(delta, is_decrease)
-
-            for price_s, qty_s in data.get("a", []):
-                price, qty = float(price_s), float(qty_s)
-
-                if qty == 0.0:
-                    old = asks.pop(price, 0.0)
-                    delta = -old
-                    is_decrease = old > 0
-                else:
-                    old = asks.get(price, 0.0)
-                    delta = qty - old
-                    is_decrease = qty < old
-                    if delta != 0:
-                        asks[price] = qty
-
-                ofi_acc_container[0] -= delta
-                ingest_update(delta, is_decrease)
-
-            lastUpdateId = u  # Set to u for proper sequence tracking
-            log_stream_stats()
-
-
-async def handle_trade_stream():
-    """Handle aggregate trade updates with stale watchdog"""
-    global trade_message_count, last_trade_msg_time
-
-    print("Trade stream connecting...")
-
-    async with websockets.connect(
-        TRADE_WS_URL, close_timeout=1, ping_interval=30, ping_timeout=10
-    ) as ws:
-        print("Trade stream live")
-        last_trade_msg_time = time.time()
-
-        async for msg in ws:
-            data = json.loads(msg)
-            if data.get("e") == "aggTrade":
-                # Update timestamp for actual trade messages
-                last_trade_msg_time = time.time()
-                trade_message_count += 1
-                price = float(data["p"])
-                quantity = float(data["q"])
-                ingest_trade(price, quantity)
-
-
-async def maturation_flusher():
-    """Periodically flush matured rows independent of metric window"""
-    global write_queue, csv_writer_thread
-    row_count = 0
+    collector = EnhancedOFICollector()
+    collector.start()
+    time.sleep(5)
 
     try:
         while True:
-            await asyncio.sleep(MATURATION_FLUSH_INTERVAL)
-
-            try:
-                completed_rows = collect_completed_rows()
-                if completed_rows and csv_writer_thread:
-                    csv_writer_thread.write_rows(completed_rows)
-                    row_count += len(completed_rows)
-            except Exception as e:
-                print(f"Maturation flusher error: {e}")
-                # Continue running despite errors
-                continue
-    except asyncio.CancelledError:
-        print("Maturation flusher cancelled - shutting down gracefully")
-        raise
-
-
-async def periodic_metrics_writer(ofi_acc_container, win_start_container):
-    """Periodically compute and write metrics"""
-    global write_queue, csv_writer_thread, samples_collected, samples_with_movement, total_price_change
-    total_rows_computed = 0
-
-    while True:
-        await asyncio.sleep(0.1)  # Check every 100ms
-
-        now = time.time()
-        if now - win_start_container[0] >= WINDOW_SEC:
-            metrics = compute_metrics(ofi_acc_container[0])
-            if metrics:
-                total_rows_computed += 1
-                # Note: metrics are added to forward_buffer in compute_metrics()
-                # Maturation flusher handles writing once forward returns can be calculated
-
-                if total_rows_computed % 10 == 0:
-                    buffered = len(forward_buffer)
-                    written = (
-                        csv_writer_thread.total_written if csv_writer_thread else 0
-                    )
-                    quality_pct = (
-                        samples_with_movement / max(samples_collected, 1)
-                    ) * 100
-                    avg_movement = (
-                        total_price_change / max(samples_with_movement, 1)
-                        if samples_with_movement > 0
-                        else 0
-                    )
-
-                    print(
-                        f"\nFLUX - Computed: {total_rows_computed} | Written: {written} | Buffered: {buffered}"
-                    )
-                    print(
-                        f"   Mid: ${metrics['mid']:,.2f} | Spread: {metrics['spread_bps']:.1f}bps"
-                    )
-                    print(
-                        f"   OFI: {metrics['ofi']:+.2f} | VPIN: {metrics['vpin']:.2%} | Momentum: {metrics['tick_momentum']:+.2f}"
-                    )
-                    if samples_collected > 0:
-                        print(
-                            f"   Quality: {quality_pct:.1f}% moved | Avg movement: {avg_movement:.6f}"
-                        )
-                    print(f"   Elapsed: {get_elapsed_time()}\n")
-
-                ofi_acc_container[0] = 0.0
-                win_start_container[0] = now
-
-
-async def run():
-    global bids, asks, lastUpdateId, start_time, csv_writer_thread
-
-    start_time = time.time()
-
-    print_banner()
-
-    resp = requests.get(SNAPSHOT_URL, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-    if resp.status_code != 200:
-        raise Exception(f"Snapshot failed: {resp.status_code}")
-
-    snap = resp.json()
-    lastUpdateId = snap["lastUpdateId"]
-    bids = SortedDict({float(p): float(q) for p, q in snap["bids"]})
-    asks = SortedDict({float(p): float(q) for p, q in snap["asks"]})
-
-    best_bid = bids.peekitem(-1)[0] if bids else 0
-    best_ask = asks.peekitem(0)[0] if asks else 0
-    mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
-    spread = best_ask - best_bid if best_bid and best_ask else 0
-
-    print(f"Snapshot: {len(bids)} bid | {len(asks)} ask | Mid: ${mid_price:,.2f}")
-
-    # Start CSV writer thread
-    csv_writer_thread = CSVWriter(OUT_CSV, CSV_FIELDNAMES)
-    csv_writer_thread.start()
-    print(f"CSV writer ready: {OUT_CSV}\n")
-
-    ofi_acc_container = [0.0]
-    win_start_container = [time.time()]
-
-    print("FLUX DATA COLLECTION ACTIVE (Ctrl+C to stop)\n")
-
-    try:
-        depth_task = asyncio.create_task(
-            retry_with_backoff(
-                handle_depth_stream,
-                "Depth Stream",
-                ofi_acc_container,
-                win_start_container,
-            )
-        )
-        trade_task = asyncio.create_task(
-            retry_with_backoff(handle_trade_stream, "Trade Stream")
-        )
-        metrics_task = asyncio.create_task(
-            periodic_metrics_writer(ofi_acc_container, win_start_container)
-        )
-        flusher_task = asyncio.create_task(maturation_flusher())
-
-        await asyncio.gather(depth_task, trade_task, metrics_task, flusher_task)
-    except (KeyboardInterrupt, asyncio.CancelledError):
+            time.sleep(1)
+    except KeyboardInterrupt:
         print("\n\n" + "=" * 80)
         print("FLUX SHUTDOWN REQUESTED - Saving data...")
         print("=" * 80)
-    except Exception as e:
-        print(f"\nError during collection: {e}")
-        print("Saving data before exit...")
-    finally:
-        buffered_count = len(forward_buffer)
-        unwritten_count = sum(1 for row in forward_buffer if not row.get("_written"))
-
-        print(f"\nFLUX - FINALIZING DATA:")
-        print(f"   Buffered rows: {buffered_count}")
-        print(f"   Need to write: {unwritten_count}")
-
-        try:
-            if unwritten_count > 0:
-                print(f"   Writing remaining data...")
-                remaining_rows = [
-                    row for row in forward_buffer if not row.get("_written")
-                ]
-                for row in remaining_rows:
-                    row.setdefault("forward_return_5s", None)
-                    row.setdefault("target_direction", None)
-                if remaining_rows and csv_writer_thread:
-                    csv_writer_thread.write_rows(remaining_rows)
-                    # Wait for queue to be fully processed
-                    await asyncio.to_thread(csv_writer_thread.queue.join)
-        finally:
-            if csv_writer_thread:
-                print(f"   Shutting down CSV writer...")
-                csv_writer_thread.shutdown()
-
-        print(f"\nFLUX DATA SAVED SUCCESSFULLY")
-        print(f"   File: {OUT_CSV} (CSV)")
-        if samples_collected > 0:
-            quality_pct = (samples_with_movement / samples_collected) * 100
-            print(f"   Data quality: {quality_pct:.1f}% with movement")
-            print(f"   Total collected: {samples_collected:,} | All matured rows saved")
+        collector.stop()
+        print("\nFLUX DATA SAVED SUCCESSFULLY")
+        print(f"   File: {CSV_FILENAME}")
         print(f"   Ready for Flux ML model training")
         print(f"   Next: Run feature engineering and model training modules\n")
         print("=" * 80)
@@ -826,7 +522,4 @@ async def run():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        pass  # Handled in run() function
+    main()
