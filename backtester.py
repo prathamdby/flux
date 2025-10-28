@@ -132,6 +132,8 @@ def simple_vectorized_backtest(
     total_trades = 0
     winning_trades = 0
     losing_trades = 0
+    gross_profit = 0.0
+    gross_loss = 0.0
     current_trade_pnl = 0.0
     in_trade = False
 
@@ -150,24 +152,45 @@ def simple_vectorized_backtest(
             # Calculate dollar return on position
             dollar_return = position_value * position.iloc[i] * forward_ret.iloc[i]
 
-            # Apply transaction costs on entry
-            if position_changed:
-                # Close previous trade before opening new one (handles long↔short flips)
-                if in_trade:
-                    if current_trade_pnl > 0:
-                        winning_trades += 1
-                    else:
-                        losing_trades += 1
+            # Apply transaction costs
+            commission_cost = 0
+            slippage_cost = 0
 
-                # Open new trade
-                commission_cost = position_value * config.COMMISSION
-                slippage_cost = position_value * config.SLIPPAGE_BPS
+            if position_changed:
+                # Close previous position if exists
+                if position.iloc[i - 1] != 0:
+                    # Calculate EXIT costs for closing position
+                    prev_position_value = prev_equity * config.POSITION_SIZE
+                    exit_commission = prev_position_value * config.COMMISSION
+                    exit_slippage = prev_position_value * config.SLIPPAGE_BPS
+
+                    # Deduct exit costs from trade PnL before recording
+                    if in_trade:
+                        current_trade_pnl -= exit_commission + exit_slippage
+
+                        # Record completed trade
+                        if current_trade_pnl > 0:
+                            winning_trades += 1
+                            gross_profit += current_trade_pnl
+                        else:
+                            losing_trades += 1
+                            gross_loss += abs(current_trade_pnl)
+
+                    # Add exit costs to total costs for this step
+                    commission_cost += exit_commission
+                    slippage_cost += exit_slippage
+
+                # Open new position - calculate ENTRY costs
+                entry_commission = position_value * config.COMMISSION
+                entry_slippage = position_value * config.SLIPPAGE_BPS
+
                 total_trades += 1
                 in_trade = True
-                current_trade_pnl = -commission_cost - slippage_cost
-            else:
-                commission_cost = 0
-                slippage_cost = 0
+                current_trade_pnl = -(entry_commission + entry_slippage)
+
+                # Add entry costs to total costs for this step
+                commission_cost += entry_commission
+                slippage_cost += entry_slippage
 
             # Accumulate PnL for this trade
             if in_trade:
@@ -178,18 +201,32 @@ def simple_vectorized_backtest(
             # Update equity
             equity[i] = prev_equity + net_dollar_return
         else:
-            # Exiting position
+            # Exiting position to flat
             if in_trade and position.iloc[i - 1] != 0:
+                # Calculate EXIT costs
+                prev_position_value = prev_equity * config.POSITION_SIZE
+                exit_commission = prev_position_value * config.COMMISSION
+                exit_slippage = prev_position_value * config.SLIPPAGE_BPS
+
+                # Deduct exit costs from trade PnL
+                current_trade_pnl -= exit_commission + exit_slippage
+
                 # Trade closed - record win/loss
                 if current_trade_pnl > 0:
                     winning_trades += 1
+                    gross_profit += current_trade_pnl
                 else:
                     losing_trades += 1
+                    gross_loss += abs(current_trade_pnl)
+
                 current_trade_pnl = 0.0
                 in_trade = False
 
-            # No position
-            equity[i] = prev_equity
+                # Update equity with exit costs
+                equity[i] = prev_equity - (exit_commission + exit_slippage)
+            else:
+                # No position
+                equity[i] = prev_equity
 
         # Prevent negative equity
         if equity[i] <= 0:
@@ -199,10 +236,23 @@ def simple_vectorized_backtest(
 
     # Close final trade if still open
     if in_trade:
+        # Apply exit costs for the final trade
+        final_position_value = equity[-1] * config.POSITION_SIZE
+        exit_commission = final_position_value * config.COMMISSION
+        exit_slippage = final_position_value * config.SLIPPAGE_BPS
+
+        # Deduct exit costs from trade PnL
+        current_trade_pnl -= exit_commission + exit_slippage
+
         if current_trade_pnl > 0:
             winning_trades += 1
+            gross_profit += current_trade_pnl
         else:
             losing_trades += 1
+            gross_loss += abs(current_trade_pnl)
+
+        # Update final equity with exit costs
+        equity[-1] -= exit_commission + exit_slippage
 
     # Calculate metrics
     final_equity = equity[-1]
@@ -210,7 +260,6 @@ def simple_vectorized_backtest(
 
     # Sharpe from equity curve
     equity_returns = np.diff(equity) / equity[:-1]
-    equity_returns = equity_returns[equity_returns != 0]
     if len(equity_returns) > 1 and np.std(equity_returns) > 0:
         sharpe = (
             np.mean(equity_returns)
@@ -234,12 +283,20 @@ def simple_vectorized_backtest(
         (winning_trades / total_closed_trades * 100) if total_closed_trades > 0 else 0.0
     )
 
+    # Profit metrics
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+    avg_win = (gross_profit / winning_trades) if winning_trades > 0 else 0.0
+    avg_loss = (gross_loss / losing_trades) if losing_trades > 0 else 0.0
+
     return {
         "strategy": strategy_name,
         "return_pct": float(total_return),
         "sharpe_ratio": float(sharpe),
         "max_drawdown_pct": float(max_dd),
         "win_rate_pct": float(win_rate),
+        "profit_factor": float(profit_factor),
+        "avg_win": float(avg_win),
+        "avg_loss": float(avg_loss),
         "num_trades": int(total_trades),
         "final_equity": float(final_equity),
     }
@@ -254,13 +311,23 @@ def validate_backtest_results(results: list[dict]):
         ret = result["return_pct"]
         sharpe = result["sharpe_ratio"]
         num_trades = result["num_trades"]
+        profit_factor = result.get("profit_factor", 0)
+        win_rate = result.get("win_rate_pct", 0)
 
         if ret > 100:
             warnings.append(f"{strategy}: Return {ret:.1f}% exceeds 100%")
-        if sharpe > 5:
-            warnings.append(f"{strategy}: Sharpe {sharpe:.1f} exceeds 5")
+        if sharpe > 3:
+            warnings.append(f"{strategy}: Sharpe {sharpe:.1f} exceeds realistic range")
         if num_trades > 0 and num_trades < 10:
             warnings.append(f"{strategy}: Only {num_trades} trades")
+        if profit_factor > 5:
+            warnings.append(
+                f"{strategy}: Profit Factor {profit_factor:.1f} > 5 suggests overfitting"
+            )
+        if win_rate < 25 or win_rate > 75:
+            warnings.append(
+                f"{strategy}: Win rate {win_rate:.1f}% outside 25-75% range"
+            )
 
     if warnings:
         print("\n" + "=" * 70)
@@ -344,17 +411,22 @@ BEST STRATEGY: {best_strategy['strategy']}
   Return:       {best_strategy['return_pct']:+.2f}%
   Trades:       {best_strategy['num_trades']:,}
   Win Rate:     {best_strategy['win_rate_pct']:.1f}%
+  Profit Factor: {best_strategy['profit_factor']:.2f}
+  Avg Win/Loss: ${best_strategy['avg_win']:.2f} / ${best_strategy['avg_loss']:.2f}
   Sharpe Ratio: {best_strategy['sharpe_ratio']:.2f}
   Max Drawdown: {best_strategy['max_drawdown_pct']:.2f}%
 
 INTERPRETATION:
   {('You made' if best_strategy['return_pct'] > 0 else 'You lost')} ${abs(best_strategy['final_equity'] - config.INITIAL_CASH):,.2f}
 
+  Profit Factor {best_strategy['profit_factor']:.2f}:
+    {'Robust! >1.75 = sustainable edge' if best_strategy['profit_factor'] > 1.75 else 'Weak edge - avg win not covering losses adequately'}
+
   Sharpe Ratio {best_strategy['sharpe_ratio']:.2f}:
     {'Good! Above 1.0 = decent risk-adjusted returns' if best_strategy['sharpe_ratio'] > 1.0 else 'Below 1.0 = returns not worth the risk'}
-  
+
   Win Rate {best_strategy['win_rate_pct']:.1f}%:
-    {'Solid - over half your trades profitable' if best_strategy['win_rate_pct'] > 50 else 'Most trades lost money - review strategy'}
+    {'Solid - over half your trades profitable' if best_strategy['win_rate_pct'] > 50 else f'Low win rate - works if avg win (${best_strategy["avg_win"]:.2f}) > 2.3x avg loss (${best_strategy["avg_loss"]:.2f})'}
 
 OVERALL:
   Strategies tested: {len(successful_results)}

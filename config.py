@@ -132,7 +132,7 @@ SLIPPAGE_BPS = 0.0002  # 2 bps slippage per trade
 INITIAL_CASH = 100_000
 
 # Position sizing
-POSITION_SIZE = 0.10  # 10% of capital per trade
+POSITION_SIZE = 0.02  # 2% of capital per trade
 
 # Strategy parameters - adaptive thresholds based on prediction distribution
 STRATEGY_SCENARIOS = {
