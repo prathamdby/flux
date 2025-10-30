@@ -16,5 +16,5 @@ dependencies = [
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
     "sortedcontainers>=2.4.0",
-    "websockets>=15.0.1",
+    "websocket-client>=1.9.0",
 ]
